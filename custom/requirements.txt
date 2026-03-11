@@ -1,0 +1,8 @@
+numpy
+pillow
+torch
+transformers
+python-dotenv
+pyyaml
+opencv-python
+rembg

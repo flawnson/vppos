@@ -1,0 +1,9 @@
+{
+  "object_name": "Canada Dry Ginger Ale Can",
+  "size_class": "medium",
+  "preferred_surfaces": [
+    "table",
+    "shelf"
+  ],
+  "must_be_upright": true
+}

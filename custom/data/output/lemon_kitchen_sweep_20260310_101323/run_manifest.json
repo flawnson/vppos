@@ -1,0 +1,10 @@
+{
+  "study_name": "lemon_kitchen_sweep",
+  "timestamp": "20260310_101323",
+  "scene": ".\\data\\input\\kitchen.jpg",
+  "object_image": ".\\data\\input\\lemon.png",
+  "config_path": ".\\config.yaml",
+  "device": "cuda",
+  "n_trials": 20,
+  "seed": 73
+}

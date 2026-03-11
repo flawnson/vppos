@@ -1,0 +1,9 @@
+{
+  "overall": 7,
+  "size_realism": 8,
+  "perspective_fit": 6,
+  "support_fit": 5,
+  "too_small": false,
+  "too_large": true,
+  "reason": "The can of Canada Dry Ginger Ale appears to be too large for the kitchen counter space in the image."
+}

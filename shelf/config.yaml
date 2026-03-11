@@ -1,0 +1,41 @@
+models:
+  inpaint_model: diffusers/stable-diffusion-xl-1.0-inpainting-0.1
+  pipeline_type: sdxl_inpaint
+  variant: fp16
+  local_files_only: false
+  enable_model_cpu_offload: false
+
+placement:
+  mode: auto
+  x_frac: 0.52
+  y_frac: 0.78
+  scale: 0.28
+  margin_px: 12
+  min_scale: 0.05
+  max_scale: 1.25
+
+shadow:
+  enabled: true
+  opacity: 0.24
+  blur_px: 21
+  offset_x: 10
+  offset_y: 14
+  squash_y: 0.18
+  shear_x: 0.12
+
+inpaint:
+  prompt: "photorealistic seamless composite, realistic lighting, natural contact shadows, consistent perspective, clean blending"
+  negative_prompt: "floating object, warped object, duplicate object, deformed object, blurry edges, halo, extra handles, extra lids, bad perspective, low quality"
+  num_inference_steps: 30
+  guidance_scale: 7.0
+  strength: 0.72
+  edge_ring_dilate_px: 26
+  edge_ring_erode_px: 12
+
+performance:
+  seed: 123
+  inference_width: 1024
+  inference_height: 1024
+  attention_slicing: false
+  enable_xformers: false
+  use_torch_compile: false

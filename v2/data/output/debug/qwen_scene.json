@@ -1,0 +1,15 @@
+{
+  "scene_type": "kitchen",
+  "candidate_surfaces": [
+    "countertop",
+    "shelf",
+    "island"
+  ],
+  "obstacles_to_avoid": [
+    "cabinet front",
+    "wall",
+    "window area"
+  ],
+  "preferred_height_band": "mid",
+  "light_direction": "natural"
+}
