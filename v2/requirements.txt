@@ -1,0 +1,12 @@
+torch
+torchvision
+numpy
+pillow
+opencv-python
+pyyaml
+transformers
+accelerate
+qwen-vl-utils
+diffusers
+safetensors
+scipy

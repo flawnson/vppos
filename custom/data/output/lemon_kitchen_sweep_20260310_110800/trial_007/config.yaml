@@ -1,0 +1,201 @@
+models:
+  detector_id: IDEA-Research/grounding-dino-base
+  sam_id: facebook/sam2.1-hiera-large
+  birefnet_id: ZhengPeng7/BiRefNet
+  depth_id: apple/DepthPro-hf
+  oneformer_id: shi-labs/oneformer_ade20k_swin_large
+  normals_id: prs-eth/marigold-normals-v1-1
+  intrinsics_id: prs-eth/marigold-iid-lighting-v1-1
+detection:
+  object_threshold: 0.22
+  object_text_threshold: 0.28
+  support_threshold: 0.32
+  support_text_threshold: 0.1
+  context_threshold: 0.18
+  context_text_threshold: 0.1
+  max_side: 1280
+segmentation:
+  use_birefnet: true
+  birefnet_size: 1024
+  birefnet_threshold: 0.30000000000000004
+  use_oneformer: false
+  oneformer_task: panoptic
+  support_label_keywords:
+  - table
+  - desk
+  - counter
+  - countertop
+  - shelf
+  - cabinet
+  - island
+  - tray
+  - stand
+  - bar
+  - kitchen
+  avoid_label_keywords:
+  - person
+  - hand
+  - arm
+  - bowl
+  - plate
+  - cup
+  - mug
+  - glass
+  - bottle
+  - jar
+  - vase
+  - plant
+  - basket
+  - box
+  - fruit
+  - food
+  - knife
+  - fork
+  - spoon
+  - sink
+  - stove
+  - toaster
+  - microwave
+  - kettle
+  - coffee
+  - appliance
+  - phone
+  - tablet
+  - laptop
+  - bag
+  min_segment_area_ratio: 0.0016444228810248167
+extraction:
+  use_rembg_fallback: true
+  rembg_alpha_threshold: 12
+  sam_box_padding: 18
+  matte_edge_blur: 0.1
+  grabcut_refine: true
+  grabcut_iters: 3
+  combine_mode: sam_prefer
+  dark_bg_fallback: true
+  erode_px: 2
+  dilate_px: 1
+  reference_box_pad_ratio: 0.56
+  reference_box_min_pad_px: 56
+  component_max_gap_px: 24
+  component_min_area_ratio: 0.00020566779785138767
+  max_border_touch_ratio: 0.18
+  reference_prompts:
+  - ingredient cluster
+  - fruit with garnish
+  - fruit with leaves
+  - citrus with mint
+  - lemon with mint
+  - produce cluster
+  - ingredient
+  - object
+geometry:
+  use_normals: false
+  use_intrinsics: false
+  normals_steps: 2
+  intrinsics_steps: 2
+  plane_normal_min_up: 0.55
+placement:
+  max_supports_to_try: 9
+  candidate_step_x_divisor: 7
+  attempt_index: 0
+  top_k_to_keep: 24
+  edge_margin_ratio: 0.12
+  min_scale_ratio: 0.25
+  max_scale_ratio: 0.45
+  avoid_overlap_weight: 1.5
+  total_overlap_weight: 6.0
+  depth_std_weight: 3.0
+  center_offset_weight: 0.6000000000000001
+  support_band_weight: 2.75
+  perspective_weight: 2.0
+  favor_empty_space_weight: 0.25
+  size_consistency_weight: 3.5
+  support_mask_penalty_weight: 2.0
+  support_depth_mismatch_weight: 3.5
+  normal_penalty_weight: 5.0
+  default_object_width_ratio: 0.30500000000000005
+  min_object_width_px: 14
+  fallback_global_search: false
+  fallback_support_margin_ratio: 0.18
+support_geometry:
+  thin_height_ratio: 0.08
+  plane_min_height_ratio: 0.1
+  edge_depth_slope_max: 0.06999999999999999
+  plane_depth_slope_min: 0.01
+  plane_depth_variance_min: 0.03
+  plane_back_start_ratio: 0.05
+  plane_front_end_ratio: 0.7000000000000001
+  edge_contact_offset_px: 1
+  plane_candidate_step_y_divisor: 7
+  surface_mask_expand_px: 18
+  surface_mask_blur_px: 7
+  surface_valid_threshold: 0.28
+  min_support_coverage: 0.1
+support_preferences:
+  preferred_labels:
+  - table
+  - desk
+  - island
+  - countertop
+  - counter
+  - kitchen counter
+  disfavored_labels:
+  - shelf
+  prefer_mode: edge
+  label_match_bonus: 5.0
+  mode_match_bonus: 0.5
+  disfavored_label_penalty: 0.5
+collision:
+  enabled: false
+  max_iou: 0.3
+  max_intersection_ratio_of_candidate: 0.09
+  use_occupancy_map: false
+  occupancy_blur_px: 4
+  occupancy_threshold: 0.6000000000000001
+  occupancy_penalty_weight: 7.5
+  hard_occupancy_reject: true
+lighting:
+  enabled: true
+  max_sources: 3
+  bright_quantile: 0.985
+  min_component_area_ratio: 0.0005
+  prefer_upper_half: 1.35
+  prefer_border_regions: 1.2
+  window_boost: 1.35
+  specular_boost: 1.15
+  ambient_floor: 0.18
+  use_depth_for_elevation: true
+shadow:
+  enabled: true
+  contact_opacity: 0.25
+  contact_blur_px: 2.5
+  cast_opacity: 0.35
+  cast_blur_px: 1.0
+  cast_length_scale: 1.1
+  squash_ratio: 0.32999999999999996
+  shear_strength: 0.18
+  shadow_color_mode: black
+  ambient_occlusion_band_ratio: 0.18
+  shadow_softness_influence: 0.4
+relighting:
+  enabled: true
+  mean_match_strength: 0.30000000000000004
+  std_match_strength: 0.0
+  color_match_strength: 0.2
+  saturation_match_strength: 0.12
+  directional_shading_strength: 0.4
+  bottom_occlusion_strength: 0.225
+  highlight_strength: 0.135
+  use_intrinsics_shading: true
+occlusion:
+  enabled: false
+  feather_px: 0.5
+  depth_bias: 0.1
+  foreground_hardness: 0.9000000000000001
+  object_depth_top_offset: 0.0
+  prefer_segment_occluders: true
+output:
+  timestamp_outputs: false
+  save_candidate_overlay: false
+  save_support_mask: false

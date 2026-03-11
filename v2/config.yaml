@@ -1,0 +1,55 @@
+models:
+  cutout_model: "ZhengPeng7/BiRefNet_lite"   # faster; switch to ZhengPeng7/BiRefNet for quality
+  matting_model: "hustvl/vitmatte-small-composition-1k"
+
+  reasoning_vlm: "Qwen/Qwen2.5-VL-3B-Instruct"   # or Qwen/Qwen2.5-VL-3B-Instruct for smaller GPUs
+
+  grounding_dino: "IDEA-Research/grounding-dino-tiny"  # or IDEA-Research/grounding-dino-base
+  sam: "facebook/sam-vit-base"  # or facebook/sam-vit-huge for best masks
+
+  depth_model: "Intel/dpt-hybrid-midas"
+
+  inpaint_model: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+
+performance:
+  use_fp16_on_cuda: true
+  enable_inpaint: false
+  inpaint_steps: 20
+  inpaint_guidance_scale: 7.5
+  inpaint_strength: 0.65
+  seed: 123
+
+placement:
+  surface_queries_default:
+    - countertop
+    - kitchen island
+    - table
+    - shelf
+  clamp_scale:
+    min: 0.05
+    max: 0.75
+  safety_margin_px: 10
+  size_profiles:
+    small:
+      support_width_frac: 0.14
+      height_frac_near: 0.13
+      height_frac_far: 0.06
+    medium:
+      support_width_frac: 0.22
+      height_frac_near: 0.20
+      height_frac_far: 0.10
+    large:
+      support_width_frac: 0.34
+      height_frac_near: 0.32
+      height_frac_far: 0.16
+
+shadow:
+  enabled: true
+  softness_px: 35
+  opacity: 0.45
+  squash_y: 0.22
+  shear_x: 0.20
+  offset_px: 22
+
+debug:
+  save_intermediates: true

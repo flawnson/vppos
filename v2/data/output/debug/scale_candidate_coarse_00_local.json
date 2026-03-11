@@ -1,0 +1,9 @@
+{
+  "overall": 5,
+  "size_realism": 7,
+  "perspective_fit": 6,
+  "support_fit": 8,
+  "too_small": false,
+  "too_large": true,
+  "reason": "The can of Canada Dry Ginger Ale appears to be too large in relation to the surrounding objects, such as the coffee machine and cups, which suggests it is not realistic."
+}

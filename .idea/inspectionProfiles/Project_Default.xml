@@ -1,0 +1,67 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="false" level="WARNING" enabled_by_default="false">
+      <option name="ignoredPackages">
+        <list>
+          <option value="arrow-cpp" />
+          <option value="aws-c-auth" />
+          <option value="aws-c-cal" />
+          <option value="aws-c-common" />
+          <option value="aws-c-compression" />
+          <option value="aws-c-event-stream" />
+          <option value="aws-c-http" />
+          <option value="aws-c-io" />
+          <option value="aws-c-mqtt" />
+          <option value="aws-c-s3" />
+          <option value="aws-c-sdkutils" />
+          <option value="aws-checksums" />
+          <option value="aws-crt-cpp" />
+          <option value="aws-sdk-cpp" />
+          <option value="bottleneck" />
+          <option value="c-ares" />
+          <option value="colorama" />
+          <option value="gensim" />
+          <option value="gflags" />
+          <option value="glog" />
+          <option value="icc_rt" />
+          <option value="joblib" />
+          <option value="libabseil" />
+          <option value="libbrotlicommon" />
+          <option value="libbrotlidec" />
+          <option value="libbrotlienc" />
+          <option value="libcurl" />
+          <option value="libgrpc" />
+          <option value="libprotobuf" />
+          <option value="libre2-11" />
+          <option value="libssh2" />
+          <option value="libthrift" />
+          <option value="numexpr" />
+          <option value="orc" />
+          <option value="pandas" />
+          <option value="pyarrow" />
+          <option value="python-dateutil" />
+          <option value="python-tzdata" />
+          <option value="pytz" />
+          <option value="re2" />
+          <option value="scikit-learn" />
+          <option value="scipy" />
+          <option value="six" />
+          <option value="smart_open" />
+          <option value="snappy" />
+          <option value="threadpoolctl" />
+          <option value="tqdm" />
+          <option value="utf8proc" />
+          <option value="wrapt" />
+          <option value="clustering" />
+          <option value="dis2vec" />
+          <option value="llvmlite" />
+          <option value="node2vec" />
+          <option value="numba" />
+          <option value="pynndescent" />
+          <option value="umap-learn" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
