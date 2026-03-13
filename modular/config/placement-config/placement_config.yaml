@@ -1,0 +1,105 @@
+input:
+  object_pad_px: 2
+
+supports:
+  max_supports_to_consider: 12
+  preselect_top_k_before_llm: 12
+  disallow_low_usable_area_below: 0.12
+  disallow_occupied_area_above: 0.72
+  plane_bonus: 0.35
+  edge_bonus: 0.10
+  homography_bonus: 0.25
+  semantic_affordance_weight: 1.7
+  semantic_hard_disallow_threshold: 0.18
+
+  llm_surface_selection_enabled: true
+  llm_surface_top_k: 2
+  llm_surface_min_score: 0.20
+  llm_surface_priority_only: true
+  validity_require_plane_or_edge_geometry: false
+
+proposal:
+  top_k_to_keep: 16
+  attempt_index: 0
+  u_samples_plane: 7
+  v_samples_plane: 5
+  x_step_divisor_edge: 4
+  per_support_candidate_cap: 6
+  final_llm_top_k: 4
+  min_object_height_ratio: 0.04
+  max_object_height_ratio: 0.26
+  edge_margin_ratio: 0.05
+  plane_u_margin: 0.08
+  plane_v_min: 0.14
+  plane_v_max: 0.76
+
+scaling:
+  support_width_ratio_min: 0.10
+  support_width_ratio_max: 0.34
+  depth_perspective_min: 0.78
+  depth_perspective_max: 1.18
+  plane_v_perspective_min: 0.84
+  plane_v_perspective_max: 1.22
+  neighbor_consistency_weight: 0.0
+  use_scene_priors: true
+  min_prior_confidence: 0.35
+  prior_support_width_fraction_min: 0.10
+  prior_support_width_fraction_max: 0.40
+  prior_support_depth_fraction_min: 0.10
+  prior_support_depth_fraction_max: 0.36
+  prior_scene_height_fraction_min: 0.04
+  prior_scene_height_fraction_max: 0.26
+  plane_depth_bias_toward_front: 1.08
+  edge_depth_assumption_fraction: 0.18
+  blend_weight_min: 0.10
+  blend_weight_max: 0.90
+  blend_prior_confidence_weight: 0.55
+  blend_geometry_quality_weight: 0.30
+  blend_homography_quality_weight: 0.15
+  blend_prior_confidence_center: 0.30
+  blend_prior_confidence_span: 0.50
+
+semantic:
+  enabled: true
+  device: cuda
+  dtype: auto
+  model_id: HuggingFaceTB/SmolVLM-500M-Instruct
+  max_new_tokens: 220
+  do_sample: false
+  temperature: 0.0
+  use_support_llm: true
+  use_candidate_llm: true
+  candidate_preview_max_side: 768
+  support_crop_context: 0.24
+  prompt_style: strict_json
+
+obstacle_avoidance:
+  occupied_weight: 8.0
+  occluder_weight: 6.5
+  support_outside_weight: 9.0
+  edge_contact_outside_weight: 5.0
+  scene_structure_weight: 2.0
+  border_penalty_weight: 3.5
+  strong_obstacle_threshold: 0.20
+  hard_reject_if_occluder_above: 0.35
+  hard_reject_if_outside_support: 0.25
+  plane_contact_point_max_distance_px: 18.0
+  plane_body_below_contact_ratio_max: 0.08
+
+ranking:
+  support_priority_weight: 0.35
+  center_alignment_weight: 0.40
+  plane_depth_preference_weight: 0.60
+  object_crop_tightness_weight: 0.15
+  free_space_weight: 1.30
+  size_prior_weight: 0.60
+  support_mode_mismatch_penalty: 0.0
+  semantic_penalty_weight: 1.6
+  semantic_bonus_weight: 1.2
+  llm_candidate_weight: 2.2
+  plane_contact_alignment_weight: 1.0
+  plane_body_below_contact_weight: 2.8
+
+output:
+  save_debug: true
+  save_json: true

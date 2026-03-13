@@ -1,0 +1,164 @@
+models:
+  detector_id: "IDEA-Research/grounding-dino-tiny"
+  depth_id: "depth-anything/Depth-Anything-V2-Small-hf"
+  oneformer_id: "shi-labs/oneformer_ade20k_swin_large"
+  normals_id: "prs-eth/marigold-normals-v1-1"
+
+runtime:
+  device: "cuda"
+  use_fp16: true
+
+input:
+  max_side: 1280
+
+support_instances:
+  enabled_sources:
+    - detector
+    - panoptic
+  canonical_labels:
+    - countertop
+    - table
+    - desk
+    - shelf
+    - bench
+    - nightstand
+    - dresser
+    - cabinet
+    - windowsill
+    - floor
+  detector_labels:
+    - countertop
+    - kitchen counter
+    - table
+    - desk
+    - shelf
+    - bookshelf
+    - bench
+    - nightstand
+    - dresser
+    - cabinet top
+    - windowsill
+    - floor
+  box_threshold: 0.22
+  text_threshold: 0.18
+  detector_nms_iou: 0.45
+  max_detector_instances: 16
+  max_panoptic_instances: 20
+  max_instances_total: 20
+  min_instance_area_ratio: 0.0020
+  max_instance_area_ratio: 0.35
+  reject_if_touches_left_right: true
+  reject_if_touches_top_bottom: true
+  max_border_touch_count: 1
+  min_box_width_ratio: 0.06
+  min_box_height_ratio: 0.03
+  panoptic_label_allowlist:
+    - table
+    - desk
+    - counter
+    - countertop
+    - shelf
+    - cabinet
+    - bench
+    - nightstand
+    - dresser
+    - bookcase
+    - floor
+    - window
+    - windowsill
+  panoptic_label_map:
+    table: table
+    desk: desk
+    counter: countertop
+    countertop: countertop
+    shelf: shelf
+    bookcase: shelf
+    cabinet: cabinet
+    bench: bench
+    nightstand: nightstand
+    dresser: dresser
+    floor: floor
+    window: windowsill
+    windowsill: windowsill
+
+segmentation:
+  enabled: true
+  task: "panoptic"
+
+normals:
+  enabled: true
+
+instance_refinement:
+  close_px: 4
+  open_px: 2
+  min_component_area_ratio: 0.0015
+  max_component_area_ratio: 0.35
+
+top_surface:
+  min_abs_nz: 0.82
+  max_abs_ny: 0.42
+  min_pixels: 240
+  close_px: 3
+  open_px: 2
+  top_band_ratio: 0.22
+  eye_level_band_ratio: 0.16
+  horizon_y_ratio: 0.46
+  min_top_band_fill_below_eye: 0.10
+  min_top_band_fill_eye_level: 0.05
+  min_visible_ratio_below_eye: 0.08
+  max_visible_ratio_eye_level: 0.28
+  edge_case_min_aspect_ratio: 1.7
+  edge_case_min_abs_nz: 0.88
+  edge_case_max_abs_ny: 0.48
+  fit_quad: true
+  polygon_epsilon_ratio: 0.02
+  reject_above_eye: true
+
+obstacle_detection:
+  edge_threshold: 0.18
+  depth_threshold: 0.12
+  min_component_area_ratio_of_top: 0.010
+  close_px: 2
+  open_px: 1
+  subtract_panoptic_objects: true
+  ignore_same_support_labels:
+    - table
+    - desk
+    - counter
+    - countertop
+    - shelf
+    - cabinet
+    - bench
+    - nightstand
+    - dresser
+    - floor
+    - window
+    - windowsill
+
+free_space:
+  min_free_area_ratio_of_top: 0.12
+  erode_margin_ratio: 0.035
+  min_component_area_ratio_of_top: 0.040
+  prefer_centered_components: true
+
+support_scoring:
+  min_final_score: 0.58
+  horizontal_weight: 0.32
+  flatness_weight: 0.16
+  free_area_weight: 0.30
+  top_visibility_weight: 0.14
+  occupancy_penalty_weight: 0.18
+  border_penalty_weight: 0.10
+  thin_penalty_weight: 0.08
+  floor_penalty: 0.10
+  cabinet_bonus_if_top_good: 0.04
+  counter_bonus: 0.05
+
+scene_priors:
+  enabled: true
+  camera_height_m: 1.5
+  scene_type_hint: ""
+
+output:
+  save_debug: true
+  save_json: true

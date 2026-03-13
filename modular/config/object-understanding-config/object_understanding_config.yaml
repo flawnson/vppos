@@ -1,0 +1,36 @@
+models:
+  vlm_model_id: Qwen/Qwen2.5-VL-3B-Instruct
+
+runtime:
+  device: cuda
+  dtype: auto
+  max_new_tokens: 384
+  do_sample: false
+  temperature: 0.0
+
+input:
+  max_side: 1280
+  allow_embedded_alpha: true
+  crop_to_alpha_if_present: true
+
+priors:
+  dimension_confidence_floor: 0.20
+  dimension_confidence_default: 0.55
+  dimension_confidence_cap: 0.90
+  min_width_m: 0.01
+  min_depth_m: 0.005
+  min_height_m: 0.01
+  max_width_m: 2.5
+  max_depth_m: 2.5
+  max_height_m: 2.5
+  fallback_units: meters
+
+validation:
+  allow_llm_fallback_to_geometry_only: true
+  reject_non_json: false
+  clip_contact_patch_ratio_min: 0.02
+  clip_contact_patch_ratio_max: 0.95
+
+output:
+  save_json: true
+  save_debug: true
