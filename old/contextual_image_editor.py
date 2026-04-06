@@ -15,7 +15,22 @@ import yaml
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFilter
 from rembg import remove
-from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor, pipeline
+from transformers import (
+    AutoModel,
+    AutoModelForZeroShotObjectDetection,
+    AutoProcessor,
+    CLIPModel,
+    CLIPProcessor,
+    pipeline,
+)
+
+try:
+    from diffusers import FluxFillPipeline  # type: ignore
+
+    _FLUX_FILL_AVAILABLE = True
+except ImportError:
+    FluxFillPipeline = None  # type: ignore
+    _FLUX_FILL_AVAILABLE = False
 
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -38,6 +53,9 @@ _DET_MODEL = None
 _SAM_PROCESSOR = None
 _SAM_MODEL = None
 _DEPTH_PIPE = None
+_FILL_PIPE = None
+_CLIP_PROCESSOR = None
+_CLIP_MODEL = None
 
 
 DEFAULT_CONFIG = {
@@ -45,6 +63,7 @@ DEFAULT_CONFIG = {
         "detector_id": "IDEA-Research/grounding-dino-tiny",
         "sam_id": "facebook/sam2.1-hiera-tiny",
         "depth_id": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+        "semantic_clip_id": "openai/clip-vit-base-patch32",
     },
     "detection": {
         "object_threshold": 0.28,
@@ -104,6 +123,33 @@ DEFAULT_CONFIG = {
         "mode_match_bonus": 1.5,
         "disfavored_label_penalty": 2.0,
     },
+    "semantic_scoring": {
+        "enabled": True,
+        "surface_prompt_templates": [
+            "a stable flat top surface for placing a {label}",
+            "a realistic place to put a {label}",
+            "an upward facing support surface for a {label}",
+        ],
+        "scene_prompt_templates": [
+            "a {label} naturally placed on this surface",
+            "a {label} resting on this surface",
+        ],
+        "support_label_bonus": 0.22,
+        "scene_patch_bonus": 0.16,
+    },
+    "placement_search": {
+        "scale_multipliers": [0.82, 0.92, 1.0, 1.1, 1.22],
+        "surface_semantic_weight": 2.2,
+        "scene_semantic_weight": 1.4,
+        "flatness_weight": 1.6,
+        "physics_weight": 2.6,
+        "occupancy_hard_threshold": 0.33,
+        "surface_semantic_min": 0.18,
+        "scene_semantic_min": 0.17,
+        "min_support_coverage_ratio": 0.58,
+        "base_contact_ratio": 0.72,
+        "allow_edge_contacts": False,
+    },
     "shadow": {
         "enabled": True,
         "contact_opacity": 0.30,
@@ -126,6 +172,28 @@ DEFAULT_CONFIG = {
         "occupancy_blur_px": 9,
         "occupancy_threshold": 0.20,
         "occupancy_penalty_weight": 10.0,
+    },
+    "refinement": {
+        "enabled": True,
+        "model_id": "black-forest-labs/FLUX.1-Fill-dev",
+        "steps": 28,
+        "guidance_scale": 18.0,
+        "max_sequence_length": 256,
+        "mask_expand_px": 18,
+        "mask_blur_px": 5,
+        "core_erode_px": 10,
+        "contact_band_ratio": 0.12,
+        "contact_expand_px": 12,
+        "crop_context_ratio": 0.55,
+        "crop_min_px": 384,
+        "crop_max_px": 1280,
+        "padding_mask_crop": 32,
+        "blend_strength": 1.0,
+        "prompt_template": "Blend the placed {label} naturally into the scene. Preserve the object's exact shape, color, surface texture, branding, and fine details. Match local lighting, contact, shadows, reflections, and occlusion only around the object boundary.",
+        "seed": 0,
+        "cpu_offload": True,
+        "skip_if_unavailable": True,
+        "object_harmonize_strength": 0.18,
     },
     "output": {
         "timestamp_outputs": True,
@@ -323,6 +391,41 @@ def get_depth_pipe(device: torch.device, cfg: dict):
             token=HF_TOKEN,
         )
     return _DEPTH_PIPE
+
+
+def get_fill_pipe(device: torch.device, cfg: dict):
+    global _FILL_PIPE
+    if not _FLUX_FILL_AVAILABLE:
+        return None
+    if _FILL_PIPE is None:
+        refine_cfg = cfg.get("refinement", {})
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        _FILL_PIPE = FluxFillPipeline.from_pretrained(
+            refine_cfg.get("model_id", "black-forest-labs/FLUX.1-Fill-dev"),
+            torch_dtype=dtype,
+            token=HF_TOKEN,
+        )
+        if device.type == "cuda":
+            if refine_cfg.get("cpu_offload", True) and hasattr(_FILL_PIPE, "enable_model_cpu_offload"):
+                _FILL_PIPE.enable_model_cpu_offload()
+            else:
+                _FILL_PIPE.to(device)
+        if hasattr(_FILL_PIPE, "vae") and hasattr(_FILL_PIPE.vae, "enable_slicing"):
+            _FILL_PIPE.vae.enable_slicing()
+        if hasattr(_FILL_PIPE, "vae") and hasattr(_FILL_PIPE.vae, "enable_tiling"):
+            _FILL_PIPE.vae.enable_tiling()
+    return _FILL_PIPE
+
+
+def get_clip_model(device: torch.device, cfg: dict):
+    global _CLIP_PROCESSOR, _CLIP_MODEL
+    if _CLIP_PROCESSOR is None or _CLIP_MODEL is None:
+        model_id = cfg["models"].get("semantic_clip_id", "openai/clip-vit-base-patch32")
+        _CLIP_PROCESSOR = CLIPProcessor.from_pretrained(model_id, token=HF_TOKEN)
+        _CLIP_MODEL = CLIPModel.from_pretrained(model_id, token=HF_TOKEN)
+        _CLIP_MODEL.to(device)
+        _CLIP_MODEL.eval()
+    return _CLIP_PROCESSOR, _CLIP_MODEL
 
 
 # ----------------------------
@@ -834,6 +937,94 @@ def estimate_reference_scale_from_neighbors(existing_boxes: List[BoundingBox], c
     return float(np.median(top))
 
 
+def cosine_to_unit_interval(value: float) -> float:
+    return float(np.clip((value + 1.0) * 0.5, 0.0, 1.0))
+
+
+def clip_image_text_score(image: Image.Image, prompts: List[str], device: torch.device, cfg: dict) -> float:
+    if not prompts:
+        return 0.0
+    processor, model = get_clip_model(device, cfg)
+    inputs = processor(text=prompts, images=[image.convert("RGB")], return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+        image_embeds = outputs.image_embeds
+        text_embeds = outputs.text_embeds
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        sims = (image_embeds @ text_embeds.T).squeeze(0).detach().float().cpu().numpy()
+    return float(np.max([cosine_to_unit_interval(float(v)) for v in np.atleast_1d(sims)]))
+
+
+def score_surface_semantics(scene_image: Image.Image, support_box: BoundingBox, object_label: str, device: torch.device, cfg: dict) -> tuple[float, float]:
+    sem_cfg = cfg.get("semantic_scoring", {})
+    if not sem_cfg.get("enabled", True):
+        return 0.5, 0.5
+
+    pad_x = int(round(support_box.width() * 0.05))
+    pad_y = int(round(support_box.height() * 0.08))
+    x0 = max(0, int(round(support_box.x0)) - pad_x)
+    y0 = max(0, int(round(support_box.y0)) - pad_y)
+    x1 = min(scene_image.width, int(round(support_box.x1)) + pad_x)
+    y1 = min(scene_image.height, int(round(support_box.y1)) + pad_y)
+    crop = scene_image.crop((x0, y0, x1, y1)).convert("RGB")
+
+    label = (support_box.label or "surface").strip()
+    surface_prompts = [p.format(label=object_label) for p in sem_cfg.get("surface_prompt_templates", [])]
+    if label:
+        surface_prompts += [
+            f"a {label} that can support a {object_label}",
+            f"a realistic {label} for placing a {object_label}",
+        ]
+
+    support_score = clip_image_text_score(crop, surface_prompts, device, cfg)
+
+    scene_prompts = [p.format(label=object_label) for p in sem_cfg.get("scene_prompt_templates", [])]
+    if label:
+        scene_prompts += [f"a {object_label} naturally placed on a {label}"]
+    scene_score = clip_image_text_score(crop, scene_prompts, device, cfg)
+
+    support_score = float(np.clip(support_score + (sem_cfg.get("support_label_bonus", 0.22) if label in {"table", "desk", "countertop", "kitchen counter", "island"} else 0.0), 0.0, 1.0))
+    scene_score = float(np.clip(scene_score + (sem_cfg.get("scene_patch_bonus", 0.16) if label in {"table", "desk", "countertop", "kitchen counter", "island"} else 0.0), 0.0, 1.0))
+    return support_score, scene_score
+
+
+def bottom_support_coverage(candidate_box: BoundingBox, support_box: BoundingBox) -> float:
+    overlap_left = max(candidate_box.x0, support_box.x0)
+    overlap_right = min(candidate_box.x1, support_box.x1)
+    overlap_w = max(0.0, overlap_right - overlap_left)
+    return float(overlap_w / max(1.0, candidate_box.width()))
+
+
+def physics_plausibility_score(candidate_box: BoundingBox, support: SupportGeometry, scene_h: int, cfg: dict) -> float:
+    search_cfg = cfg.get("placement_search", {})
+    support_cov = bottom_support_coverage(candidate_box, support.box)
+    min_cov = float(search_cfg.get("min_support_coverage_ratio", 0.58))
+    base_contact_ratio = float(search_cfg.get("base_contact_ratio", 0.72))
+
+    base_y = candidate_box.y1
+    contact_y = support.plane_y_min if support.mode == "edge" else float(np.clip(base_y, support.plane_y_min, support.plane_y_max))
+    y_gap = abs(base_y - contact_y) / max(2.0, candidate_box.height() * 0.08)
+    y_term = float(np.exp(-y_gap))
+
+    coverage_term = float(np.clip((support_cov - min_cov) / max(1e-6, 1.0 - min_cov), 0.0, 1.0))
+    if support_cov < min_cov:
+        coverage_term *= 0.2
+
+    if support.mode == "plane":
+        base_ratio = np.clip((base_y - support.plane_y_min) / max(1.0, support.plane_y_max - support.plane_y_min), 0.0, 1.0)
+        contact_pref = 1.0 - abs(base_ratio - base_contact_ratio)
+        contact_pref = float(np.clip(contact_pref, 0.0, 1.0))
+    else:
+        contact_pref = 1.0
+        if not search_cfg.get("allow_edge_contacts", False):
+            contact_pref *= 0.7
+
+    elevation_penalty = float(np.clip((candidate_box.y0 / max(1.0, scene_h) - 0.05) / 0.95, 0.0, 1.0))
+    return float(np.clip(0.45 * coverage_term + 0.35 * y_term + 0.15 * contact_pref + 0.05 * elevation_penalty, 0.0, 1.0))
+
+
 def choose_target_size(
     scene_size: Tuple[int, int],
     obj_size: Tuple[int, int],
@@ -1093,14 +1284,43 @@ def rank_placements(
     existing_same_objects: List[BoundingBox],
     depth_map: Optional[np.ndarray],
     cfg: dict,
+    device: torch.device,
 ) -> List[PlacementCandidate]:
     scene_w, scene_h = scene_image.size
     support_geometries = build_support_geometries(support_boxes, scene_image.size, depth_map, cfg)
     out: List[PlacementCandidate] = []
 
-    for support in support_geometries[: int(cfg["placement"].get("max_supports_to_try", 6))]:
-        seed_depth = depth_at_box_base(depth_map, support.box) if depth_map is not None else 0.5
+    collision_cfg = cfg.get("collision", {})
+    search_cfg = cfg.get("placement_search", {})
+    occupancy_map = None
+    if collision_cfg.get("enabled", True) and collision_cfg.get("use_occupancy_map", True):
+        occupancy_map = build_occupancy_map(
+            scene_image.size,
+            avoid_boxes,
+            blur_px=int(collision_cfg.get("occupancy_blur_px", 9)),
+        )
 
+    support_semantic_cache: dict[tuple[int, int, int, int, str], tuple[float, float]] = {}
+    scale_multipliers = [float(v) for v in search_cfg.get("scale_multipliers", [0.82, 0.92, 1.0, 1.1, 1.22])]
+
+    for support in support_geometries[: int(cfg["placement"].get("max_supports_to_try", 6))]:
+        support_key = (*support.box.to_int_tuple(), support.box.label or "")
+        if support_key not in support_semantic_cache:
+            support_semantic_cache[support_key] = score_surface_semantics(
+                scene_image=scene_image,
+                support_box=support.box,
+                object_label=extracted_object.label,
+                device=device,
+                cfg=cfg,
+            )
+        support_semantic, scene_semantic = support_semantic_cache[support_key]
+
+        if support_semantic < float(search_cfg.get("surface_semantic_min", 0.18)):
+            continue
+        if scene_semantic < float(search_cfg.get("scene_semantic_min", 0.17)):
+            continue
+
+        seed_depth = depth_at_box_base(depth_map, support.box) if depth_map is not None else 0.5
         base_w, base_h = choose_target_size(
             scene_size=scene_image.size,
             obj_size=extracted_object.rgba.size,
@@ -1112,93 +1332,109 @@ def rank_placements(
             cfg=cfg,
         )
 
-        for x, foot_y in candidate_positions_on_support(support, base_w, base_h, scene_w, scene_h, cfg):
-            sample_y = foot_y - int(base_h * 0.20) if support.mode == "edge" else foot_y - int(base_h * 0.08)
+        for scale_mul in scale_multipliers:
+            scaled_w = max(24, int(round(base_w * scale_mul)))
+            scaled_h = max(24, int(round(base_h * scale_mul)))
 
-            depth_median, depth_std = (0.5, 0.25)
-            if depth_map is not None:
-                depth_median, depth_std = local_depth_stats(
-                    depth_map,
-                    x=x + int(base_w * 0.1),
-                    y=max(0, sample_y),
-                    w=max(6, int(base_w * 0.8)),
-                    h=max(4, int(base_h * 0.22)),
+            for x, foot_y in candidate_positions_on_support(support, scaled_w, scaled_h, scene_w, scene_h, cfg):
+                sample_y = foot_y - int(scaled_h * 0.20) if support.mode == "edge" else foot_y - int(scaled_h * 0.08)
+
+                depth_median, depth_std = (0.5, 0.25)
+                if depth_map is not None:
+                    depth_median, depth_std = local_depth_stats(
+                        depth_map,
+                        x=x + int(scaled_w * 0.1),
+                        y=max(0, sample_y),
+                        w=max(6, int(scaled_w * 0.8)),
+                        h=max(4, int(scaled_h * 0.22)),
+                    )
+
+                center_guess = (x + scaled_w * 0.5, foot_y - scaled_h * 0.5)
+                target_w, target_h = choose_target_size(
+                    scene_size=scene_image.size,
+                    obj_size=extracted_object.rgba.size,
+                    support_box=support.box,
+                    existing_same_objects=existing_same_objects,
+                    depth_map=depth_map,
+                    candidate_depth=depth_median,
+                    candidate_center=center_guess,
+                    cfg=cfg,
                 )
+                target_w = max(24, int(round(target_w * scale_mul)))
+                target_h = max(24, int(round(target_h * scale_mul)))
 
-            center_guess = (x + base_w * 0.5, foot_y - base_h * 0.5)
-            target_w, target_h = choose_target_size(
-                scene_size=scene_image.size,
-                obj_size=extracted_object.rgba.size,
-                support_box=support.box,
-                existing_same_objects=existing_same_objects,
-                depth_map=depth_map,
-                candidate_depth=depth_median,
-                candidate_center=center_guess,
-                cfg=cfg,
-            )
+                if support.mode == "plane":
+                    plane_rel = np.clip(
+                        (foot_y - support.plane_y_min) / max(1.0, support.plane_y_max - support.plane_y_min),
+                        0.0,
+                        1.0,
+                    )
+                    persp = float(np.interp(plane_rel, [0.0, 1.0], [0.90, 1.18]))
+                else:
+                    persp = 1.0
 
-            if support.mode == "plane":
-                plane_rel = np.clip(
-                    (foot_y - support.plane_y_min) / max(1.0, support.plane_y_max - support.plane_y_min),
-                    0.0,
-                    1.0,
+                target_w = int(round(target_w * persp))
+                target_h = int(round(target_h * persp))
+                obj_y = int(round(foot_y - target_h))
+                candidate_box = BoundingBox(x, obj_y, x + target_w, obj_y + target_h)
+                if candidate_box.y0 < 0 or candidate_box.x0 < 0 or candidate_box.x1 > scene_w or candidate_box.y1 > scene_h:
+                    continue
+
+                overlaps = [iou(candidate_box, other) for other in avoid_boxes]
+                max_overlap = max(overlaps, default=0.0)
+                sum_overlap = sum(overlaps)
+                if collision_cfg.get("enabled", True) and max_overlap > float(collision_cfg.get("max_iou", 0.01)):
+                    continue
+
+                inter_ratios = [candidate_intersection_ratio(candidate_box, other) for other in avoid_boxes]
+                if inter_ratios and max(inter_ratios) > float(collision_cfg.get("max_intersection_ratio_of_candidate", 0.02)):
+                    continue
+
+                occupancy_penalty = 0.0
+                if occupancy_map is not None:
+                    occ_score = occupancy_score_for_box(occupancy_map, candidate_box)
+                    if occ_score > float(search_cfg.get("occupancy_hard_threshold", 0.33)):
+                        continue
+                    occupancy_penalty = occ_score * float(collision_cfg.get("occupancy_penalty_weight", 10.0))
+
+                center_offset = abs(candidate_box.centre()[0] - support.box.centre()[0]) / max(1.0, support.box.width())
+                if support.mode == "plane":
+                    support_band_pref = abs(
+                        (foot_y - support.plane_y_min) / max(1.0, support.plane_y_max - support.plane_y_min) - 0.35
+                    )
+                else:
+                    support_band_pref = 0.0
+
+                predicted_w, predicted_h = choose_target_size(
+                    scene_size=scene_image.size,
+                    obj_size=extracted_object.rgba.size,
+                    support_box=support.box,
+                    existing_same_objects=existing_same_objects,
+                    depth_map=depth_map,
+                    candidate_depth=depth_median,
+                    candidate_center=candidate_box.centre(),
+                    cfg=cfg,
                 )
-                persp = float(np.interp(plane_rel, [0.0, 1.0], [0.90, 1.18]))
-            else:
-                persp = 1.0
+                size_consistency = (abs(predicted_w - target_w) / max(1.0, predicted_w)) + (abs(predicted_h - target_h) / max(1.0, predicted_h))
 
-            target_w = int(round(target_w * persp))
-            target_h = int(round(target_h * persp))
+                empty_space_score = 0.0
+                ccx, ccy = candidate_box.centre()
+                for other in avoid_boxes:
+                    ocx, ocy = other.centre()
+                    dist = ((ocx - ccx) ** 2 + (ocy - ccy) ** 2) ** 0.5
+                    empty_space_score += 1.0 / max(30.0, dist)
 
-            obj_y = int(round(foot_y - target_h))
+                mode_penalty = 0.0
+                if support.mode == "edge":
+                    mode_penalty = max(0.0, support.depth_slope - 0.05) * 3.0
+                else:
+                    mode_penalty = max(0.0, 0.035 - support.depth_slope) * 4.0
 
-            candidate_box = BoundingBox(x, obj_y, x + target_w, obj_y + target_h)
-            if candidate_box.y0 < 0 or candidate_box.x0 < 0 or candidate_box.x1 > scene_w or candidate_box.y1 > scene_h:
-                continue
+                preference_adjustment = support_preference_adjustment(support, cfg)
+                flatness_score = float(np.clip(1.0 - min(1.0, depth_std / 0.08), 0.0, 1.0))
+                physics_score = physics_plausibility_score(candidate_box, support, scene_h, cfg)
 
-            overlaps = [iou(candidate_box, other) for other in avoid_boxes]
-            max_overlap = max(overlaps, default=0.0)
-            sum_overlap = sum(overlaps)
-
-            support_cx = support.box.centre()[0]
-            center_offset = abs(candidate_box.centre()[0] - support_cx) / max(1.0, support.box.width())
-
-            if support.mode == "plane":
-                support_band_pref = abs(
-                    (foot_y - support.plane_y_min) / max(1.0, support.plane_y_max - support.plane_y_min) - 0.35
-                )
-            else:
-                support_band_pref = 0.0
-
-            predicted_w, predicted_h = choose_target_size(
-                scene_size=scene_image.size,
-                obj_size=extracted_object.rgba.size,
-                support_box=support.box,
-                existing_same_objects=existing_same_objects,
-                depth_map=depth_map,
-                candidate_depth=depth_median,
-                candidate_center=candidate_box.centre(),
-                cfg=cfg,
-            )
-
-            size_consistency = (abs(predicted_w - target_w) / max(1.0, predicted_w)) + (abs(predicted_h - target_h) / max(1.0, predicted_h))
-
-            empty_space_score = 0.0
-            ccx, ccy = candidate_box.centre()
-            for other in avoid_boxes:
-                ocx, ocy = other.centre()
-                dist = ((ocx - ccx) ** 2 + (ocy - ccy) ** 2) ** 0.5
-                empty_space_score += 1.0 / max(30.0, dist)
-
-            mode_penalty = 0.0
-            if support.mode == "edge":
-                mode_penalty = max(0.0, support.depth_slope - 0.05) * 3.0
-            else:
-                mode_penalty = max(0.0, 0.035 - support.depth_slope) * 4.0
-
-            preference_adjustment = support_preference_adjustment(support, cfg)
-
-            score = (
+                score = (
                     max_overlap * cfg["placement"]["avoid_overlap_weight"]
                     + sum_overlap * cfg["placement"]["total_overlap_weight"]
                     + depth_std * cfg["placement"]["depth_std_weight"]
@@ -1209,29 +1445,30 @@ def rank_placements(
                     + size_consistency * cfg["placement"]["size_consistency_weight"]
                     + mode_penalty
                     + preference_adjustment
-            )
-
-            out.append(
-                PlacementCandidate(
-                    placement=Placement(
-                        x=int(candidate_box.x0),
-                        y=int(candidate_box.y0),
-                        width=target_w,
-                        height=target_h,
-                        support_box=support.box,
-                    ),
-                    score=float(score),
-                    debug=(
-                        f"label={support.box.label} "
-                        f"mode={support.mode} "
-                        f"pref={preference_adjustment:.3f} "
-                        f"overlap={max_overlap:.3f} "
-                        f"depth_std={depth_std:.3f} "
-                        f"depth_slope={support.depth_slope:.3f} "
-                        f"perspective={persp:.3f}"
-                    ),
+                    + occupancy_penalty
+                    - support_semantic * float(search_cfg.get("surface_semantic_weight", 2.2))
+                    - scene_semantic * float(search_cfg.get("scene_semantic_weight", 1.4))
+                    - flatness_score * float(search_cfg.get("flatness_weight", 1.6))
+                    - physics_score * float(search_cfg.get("physics_weight", 2.6))
                 )
-            )
+
+                out.append(
+                    PlacementCandidate(
+                        placement=Placement(
+                            x=int(candidate_box.x0),
+                            y=int(candidate_box.y0),
+                            width=target_w,
+                            height=target_h,
+                            support_box=support.box,
+                        ),
+                        score=float(score),
+                        debug=(
+                            f"label={support.box.label} mode={support.mode} sem={support_semantic:.3f}/{scene_semantic:.3f} "
+                            f"flat={flatness_score:.3f} phys={physics_score:.3f} overlap={max_overlap:.3f} "
+                            f"depth_std={depth_std:.3f} persp={persp:.3f} scale={scale_mul:.2f}"
+                        ),
+                    )
+                )
 
     out.sort(key=lambda c: c.score)
     return out[: int(cfg["placement"].get("top_k_to_keep", 12))]
@@ -1330,9 +1567,46 @@ def build_projected_shadow(alpha: Image.Image, placement: Placement, light_dir: 
     return Image.fromarray(warped, mode="L")
 
 
-def composite_object(scene_image: Image.Image, extracted_object: ExtractedObject, placement: Placement, cfg: dict) -> Image.Image:
+def harmonize_object_to_scene(obj_rgba: Image.Image, scene_patch: Image.Image, strength: float) -> Image.Image:
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return obj_rgba
+
+    rgba = np.array(obj_rgba.convert("RGBA"), dtype=np.uint8)
+    alpha = rgba[..., 3]
+    mask = alpha > 0
+    if not np.any(mask):
+        return obj_rgba
+
+    obj_rgb = rgba[..., :3].astype(np.float32)
+    patch_gray = np.array(scene_patch.convert("L"), dtype=np.float32) / 255.0
+    target_mean = float(np.mean(patch_gray))
+
+    obj_gray = cv2.cvtColor(rgba[..., :3], cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    obj_mean = float(np.mean(obj_gray[mask]))
+    gain = target_mean / max(1e-4, obj_mean)
+    gain = float(np.clip(gain, 0.82, 1.18))
+    gain = 1.0 + (gain - 1.0) * strength
+
+    obj_rgb[mask] *= gain
+    rgba[..., :3] = np.clip(obj_rgb, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def render_initial_composite(
+    scene_image: Image.Image,
+    extracted_object: ExtractedObject,
+    placement: Placement,
+    cfg: dict,
+) -> tuple[Image.Image, Image.Image]:
     canvas = scene_image.convert("RGBA")
     obj = extracted_object.rgba.resize((placement.width, placement.height), Image.LANCZOS)
+
+    harmonize_strength = float(cfg.get("refinement", {}).get("object_harmonize_strength", 0.18))
+    if harmonize_strength > 0.0:
+        scene_patch = sample_surface_patch(scene_image, placement)
+        obj = harmonize_object_to_scene(obj, scene_patch, harmonize_strength)
+
     alpha = obj.getchannel("A")
 
     if cfg["shadow"].get("enabled", True):
@@ -1374,7 +1648,194 @@ def composite_object(scene_image: Image.Image, extracted_object: ExtractedObject
     obj_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     obj_layer.alpha_composite(obj, dest=(placement.x, placement.y))
     canvas = Image.alpha_composite(canvas, obj_layer)
-    return canvas.convert("RGB")
+
+    full_mask = Image.new("L", scene_image.size, 0)
+    full_mask.paste(alpha, (placement.x, placement.y))
+    return canvas.convert("RGB"), full_mask
+
+
+def build_refinement_mask(full_object_mask: Image.Image, placement: Placement, cfg: dict) -> Image.Image:
+    refine_cfg = cfg.get("refinement", {})
+    mask = np.array(full_object_mask, dtype=np.uint8)
+    expand_px = max(1, int(refine_cfg.get("mask_expand_px", 18)))
+    core_erode_px = max(1, int(refine_cfg.get("core_erode_px", 10)))
+    contact_expand_px = max(1, int(refine_cfg.get("contact_expand_px", 12)))
+
+    kernel_expand = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expand_px * 2 + 1, expand_px * 2 + 1))
+    kernel_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_erode_px * 2 + 1, core_erode_px * 2 + 1))
+    dilated = cv2.dilate(mask, kernel_expand)
+    core = cv2.erode(mask, kernel_core)
+    ring = cv2.subtract(dilated, core)
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) > 0 and len(ys) > 0:
+        y_bottom = int(np.max(ys))
+        x0 = int(np.min(xs))
+        x1 = int(np.max(xs))
+        band_h = max(4, int(round((y_bottom - int(np.min(ys)) + 1) * float(refine_cfg.get("contact_band_ratio", 0.12)))))
+        contact = np.zeros_like(mask, dtype=np.uint8)
+        y0 = max(0, y_bottom - band_h + 1)
+        contact[y0 : min(mask.shape[0], y_bottom + contact_expand_px + 1), max(0, x0 - contact_expand_px) : min(mask.shape[1], x1 + contact_expand_px + 1)] = 255
+        kernel_contact = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (contact_expand_px * 2 + 1, contact_expand_px * 2 + 1))
+        contact = cv2.dilate(contact, kernel_contact)
+        ring = np.maximum(ring, contact)
+
+    blur_px = float(refine_cfg.get("mask_blur_px", 5))
+    ring = cv2.GaussianBlur(ring, (0, 0), sigmaX=max(0.5, blur_px), sigmaY=max(0.5, blur_px))
+    ring = np.clip(ring, 0, 255).astype(np.uint8)
+    return Image.fromarray(ring, mode="L")
+
+
+def mask_bbox(mask: Image.Image) -> Optional[Tuple[int, int, int, int]]:
+    arr = np.array(mask, dtype=np.uint8)
+    ys, xs = np.where(arr > 8)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def expand_crop_box(
+    bbox: Tuple[int, int, int, int],
+    image_size: Tuple[int, int],
+    placement: Placement,
+    cfg: dict,
+) -> Tuple[int, int, int, int]:
+    refine_cfg = cfg.get("refinement", {})
+    x0, y0, x1, y1 = bbox
+    w = x1 - x0
+    h = y1 - y0
+    context = float(refine_cfg.get("crop_context_ratio", 0.55))
+    pad_x = int(round(max(w, placement.width) * context))
+    pad_y = int(round(max(h, placement.height) * context))
+
+    x0 -= pad_x
+    y0 -= pad_y
+    x1 += pad_x
+    y1 += pad_y
+
+    min_px = int(refine_cfg.get("crop_min_px", 384))
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    if crop_w < min_px:
+        extra = min_px - crop_w
+        x0 -= extra // 2
+        x1 += extra - extra // 2
+    if crop_h < min_px:
+        extra = min_px - crop_h
+        y0 -= extra // 2
+        y1 += extra - extra // 2
+
+    img_w, img_h = image_size
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(img_w, x1)
+    y1 = min(img_h, y1)
+
+    max_px = int(refine_cfg.get("crop_max_px", 1280))
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    if crop_w > max_px or crop_h > max_px:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        half_w = min(max_px / 2.0, crop_w / 2.0)
+        half_h = min(max_px / 2.0, crop_h / 2.0)
+        x0 = int(round(cx - half_w))
+        x1 = int(round(cx + half_w))
+        y0 = int(round(cy - half_h))
+        y1 = int(round(cy + half_h))
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(img_w, x1)
+        y1 = min(img_h, y1)
+
+    return x0, y0, x1, y1
+
+
+def round_to_multiple(value: int, multiple: int = 16) -> int:
+    return max(multiple, int(round(value / multiple) * multiple))
+
+
+def refine_composite_with_flux_fill(
+    composite: Image.Image,
+    full_object_mask: Image.Image,
+    placement: Placement,
+    object_label: str,
+    device: torch.device,
+    cfg: dict,
+) -> Image.Image:
+    refine_cfg = cfg.get("refinement", {})
+    if not refine_cfg.get("enabled", True):
+        return composite
+
+    pipe = get_fill_pipe(device, cfg)
+    if pipe is None:
+        if refine_cfg.get("skip_if_unavailable", True):
+            print("FLUX Fill refinement unavailable; using direct composite result.")
+            return composite
+        raise RuntimeError("FLUX Fill refinement requested but diffusers/FluxFillPipeline is not available.")
+
+    refine_mask = build_refinement_mask(full_object_mask, placement, cfg)
+    bbox = mask_bbox(refine_mask)
+    if bbox is None:
+        return composite
+
+    crop_box = expand_crop_box(bbox, composite.size, placement, cfg)
+    crop_image = composite.crop(crop_box).convert("RGB")
+    crop_mask = refine_mask.crop(crop_box).convert("L")
+
+    out_w = round_to_multiple(crop_image.size[0], 16)
+    out_h = round_to_multiple(crop_image.size[1], 16)
+
+    prompt_template = refine_cfg.get("prompt_template", "Blend the placed {label} naturally into the scene.")
+    prompt = str(prompt_template).format(label=object_label)
+
+    seed = int(refine_cfg.get("seed", 0))
+    generator = torch.Generator(device="cpu").manual_seed(seed) if seed >= 0 else None
+
+    try:
+        result = pipe(
+            prompt=prompt,
+            image=crop_image.resize((out_w, out_h), Image.LANCZOS),
+            mask_image=crop_mask.resize((out_w, out_h), Image.LANCZOS),
+            height=out_h,
+            width=out_w,
+            guidance_scale=float(refine_cfg.get("guidance_scale", 18.0)),
+            num_inference_steps=int(refine_cfg.get("steps", 28)),
+            max_sequence_length=int(refine_cfg.get("max_sequence_length", 256)),
+            padding_mask_crop=int(refine_cfg.get("padding_mask_crop", 32)),
+            generator=generator,
+        ).images[0].convert("RGB")
+    except Exception as exc:
+        if refine_cfg.get("skip_if_unavailable", True):
+            print(f"FLUX Fill refinement failed ({exc}); using direct composite result.")
+            return composite
+        raise
+
+    result = result.resize(crop_image.size, Image.LANCZOS)
+
+    blur_px = float(refine_cfg.get("mask_blur_px", 5))
+    soft_mask = crop_mask.filter(ImageFilter.GaussianBlur(radius=max(0.5, blur_px)))
+    blend_strength = float(np.clip(refine_cfg.get("blend_strength", 1.0), 0.0, 1.0))
+    if blend_strength < 0.999:
+        soft_arr = np.array(soft_mask, dtype=np.float32) * blend_strength
+        soft_mask = Image.fromarray(np.clip(soft_arr, 0, 255).astype(np.uint8), mode="L")
+
+    blended = Image.composite(result, crop_image, soft_mask)
+    final = composite.copy()
+    final.paste(blended, crop_box[:2])
+    return final
+
+
+def composite_object(
+    scene_image: Image.Image,
+    extracted_object: ExtractedObject,
+    placement: Placement,
+    object_label: str,
+    device: torch.device,
+    cfg: dict,
+) -> Image.Image:
+    initial, full_object_mask = render_initial_composite(scene_image, extracted_object, placement, cfg)
+    return refine_composite_with_flux_fill(initial, full_object_mask, placement, object_label, device, cfg)
 
 
 def build_output_path(output_arg: str | Path, timestamp_outputs: bool = True) -> Path:
@@ -1519,11 +1980,12 @@ def main() -> None:
         existing_same_objects=existing_same_objects,
         depth_map=depth_map,
         cfg=cfg,
+        device=device,
     )
     placement = choose_placement_from_ranked(ranked_candidates, int(cfg["placement"].get("attempt_index", 0)))
     print(f"Placement chosen at x={placement.x}, y={placement.y}, w={placement.width}, h={placement.height}")
 
-    result = composite_object(scene, extracted, placement, cfg)
+    result = composite_object(scene, extracted, placement, args.object_label, device, cfg)
 
     output_path = build_output_path(args.output, bool(cfg["output"].get("timestamp_outputs", True)))
     output_path.parent.mkdir(parents=True, exist_ok=True)

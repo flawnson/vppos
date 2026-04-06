@@ -121,6 +121,15 @@ DEFAULT_EXTRACT_CFG: Dict[str, Any] = {
         "alpha_hard_zero_below": 8,
         "alpha_hard_full_above": 248,
     },
+    "detail_preservation": {
+        "enabled": True,
+        "edge_guided_alpha": True,
+        "edge_expand_px": 2,
+        "edge_percentile": 72.0,
+        "edge_weight": 0.55,
+        "interior_restore_erode_px": 1,
+        "detail_boost": 1.18,
+    },
     "fallback": {
         "use_rembg_if_available": True,
         "use_dark_bg_heuristic": True,
@@ -1032,6 +1041,55 @@ def _binary_to_soft_alpha(binary_u8: np.ndarray, cfg: dict) -> np.ndarray:
     return alpha.astype(np.uint8)
 
 
+def _preserve_fine_details(binary_u8: np.ndarray, image_rgb: np.ndarray, cfg: dict) -> np.ndarray:
+    detail_cfg = cfg.get("detail_preservation", {}) or {}
+    if not bool(detail_cfg.get("enabled", True)):
+        return binary_u8
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(grad_x, grad_y)
+    thr = float(np.percentile(grad, float(detail_cfg.get("edge_percentile", 72.0))))
+    strong_edges = (grad >= thr).astype(np.uint8) * 255
+
+    if bool(detail_cfg.get("edge_guided_alpha", True)):
+        k = max(1, int(detail_cfg.get("edge_expand_px", 2)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+        boundary = cv2.morphologyEx(binary_u8, cv2.MORPH_GRADIENT, kernel)
+        guided = cv2.bitwise_and(strong_edges, cv2.dilate(boundary, kernel))
+        restored = cv2.bitwise_or(binary_u8, guided)
+    else:
+        restored = binary_u8.copy()
+
+    restored = _postprocess_mask(restored, cfg)
+    return restored
+
+
+def _detail_boost_rgba(rgb: np.ndarray, alpha: np.ndarray, cfg: dict) -> np.ndarray:
+    detail_cfg = cfg.get("detail_preservation", {}) or {}
+    if not bool(detail_cfg.get("enabled", True)):
+        return np.dstack([rgb, alpha]).astype(np.uint8)
+
+    boost = float(detail_cfg.get("detail_boost", 1.18))
+    if boost <= 1.0:
+        return np.dstack([rgb, alpha]).astype(np.uint8)
+
+    rgb_f = rgb.astype(np.float32)
+    blur = cv2.GaussianBlur(rgb_f, (0, 0), 1.2)
+    high = rgb_f - blur
+    detail = np.clip(blur + high * boost, 0.0, 255.0)
+
+    erode_px = max(0, int(detail_cfg.get("interior_restore_erode_px", 1)))
+    alpha_mask = (alpha > 0).astype(np.uint8) * 255
+    if erode_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+        alpha_mask = cv2.erode(alpha_mask, kernel)
+    mask_f = (alpha_mask.astype(np.float32) / 255.0)[..., None]
+    out = np.clip(rgb_f * (1.0 - mask_f) + detail * mask_f, 0.0, 255.0).astype(np.uint8)
+    return np.dstack([out, alpha]).astype(np.uint8)
+
+
 # -----------------------------------------------------------------------------
 # Embedded alpha path
 # -----------------------------------------------------------------------------
@@ -1150,13 +1208,14 @@ def extract_object(
 
     merged = _merge_candidates(candidates, image_shape=rgb_np.shape[:2], cfg=cfg)
     final_binary = _postprocess_mask(merged, cfg)
+    final_binary = _preserve_fine_details(final_binary, rgb_np, cfg)
 
     if final_binary.max() == 0:
         raise RuntimeError("Extraction failed: final mask is empty after postprocessing.")
 
     final_alpha = _binary_to_soft_alpha(final_binary, cfg)
 
-    rgba_np = np.dstack([rgb_np, final_alpha]).astype(np.uint8)
+    rgba_np = _detail_boost_rgba(rgb_np, final_alpha, cfg)
     rgba_np[final_alpha == 0, :3] = 0
     rgba = _np_to_pil_rgba(rgba_np)
 
@@ -1218,6 +1277,7 @@ def extract_object(
             "scale_for_processing": scale,
             "used_object_understanding": object_understanding is not None,
             "object_understanding_debug": cfg.get("_object_understanding_debug", {}),
+            "detail_preservation": cfg.get("detail_preservation", {}),
         },
     )
 

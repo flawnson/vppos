@@ -121,6 +121,16 @@ DEFAULT_PLACEMENT_CFG: Dict[str, Any] = {
         "plane_contact_alignment_weight": 1.0,
         "plane_body_below_contact_weight": 2.8,
     },
+    "refinement": {
+        "enabled": True,
+        "color_match_strength": 0.70,
+        "detail_preserve_strength": 0.82,
+        "boundary_blend_width_px": 9,
+        "use_seamless_clone": True,
+        "shadow_strength": 0.22,
+        "shadow_blur_px": 11,
+        "shadow_offset_y_px": 4,
+    },
     "output": {
         "save_debug": True,
         "save_json": True,
@@ -251,6 +261,139 @@ def _place_rgba_over_rgb(scene_rgb: np.ndarray, obj_rgba: np.ndarray, x: int, y:
     blended = obj_patch[:, :, :3] * alpha + patch * (1.0 - alpha)
     out[y1:y2, x1:x2, :] = np.clip(blended, 0, 255).astype(np.uint8)
     return out
+
+
+def _extract_patch(arr: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    return arr[y0:y1, x0:x1].copy()
+
+
+def _expand_box(box: Tuple[int, int, int, int], image_shape: Tuple[int, int], pad: int) -> Tuple[int, int, int, int]:
+    h, w = image_shape[:2]
+    x0, y0, x1, y1 = box
+    return max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+
+
+def _placed_object_box(x: int, y: int, w: int, h: int, scene_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    H, W = scene_shape[:2]
+    return max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+
+
+def _match_object_to_local_context(obj_rgba: np.ndarray, scene_rgb: np.ndarray, x: int, y: int, cfg: dict) -> np.ndarray:
+    ref_cfg = cfg.get("refinement", {}) or {}
+    strength = float(ref_cfg.get("color_match_strength", 0.70))
+    if strength <= 0.0:
+        return obj_rgba
+
+    box = _placed_object_box(x, y, obj_rgba.shape[1], obj_rgba.shape[0], scene_rgb.shape)
+    pad = max(8, int(round(0.18 * max(box[2] - box[0], box[3] - box[1]))))
+    ctx_box = _expand_box(box, scene_rgb.shape, pad)
+    ctx = _extract_patch(scene_rgb, ctx_box)
+    if ctx.size == 0:
+        return obj_rgba
+
+    obj_rgb = obj_rgba[:, :, :3].astype(np.uint8)
+    alpha = obj_rgba[:, :, 3]
+    if int((alpha > 0).sum()) < 12:
+        return obj_rgba
+
+    scene_lab = cv2.cvtColor(ctx, cv2.COLOR_RGB2LAB).astype(np.float32)
+    obj_lab = cv2.cvtColor(obj_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    mask = alpha > 8
+    obj_vals = obj_lab[mask]
+    scene_vals = scene_lab.reshape(-1, 3)
+    if len(obj_vals) < 12 or len(scene_vals) < 12:
+        return obj_rgba
+
+    obj_mean = obj_vals.mean(axis=0)
+    obj_std = obj_vals.std(axis=0) + 1e-6
+    scene_mean = scene_vals.mean(axis=0)
+    scene_std = scene_vals.std(axis=0) + 1e-6
+    matched = obj_lab.copy()
+    matched[mask] = (obj_lab[mask] - obj_mean) * (scene_std / obj_std) + scene_mean
+    matched = obj_lab * (1.0 - strength) + matched * strength
+    matched = np.clip(matched, 0.0, 255.0).astype(np.uint8)
+    out_rgb = cv2.cvtColor(matched, cv2.COLOR_LAB2RGB)
+    return np.dstack([out_rgb, alpha]).astype(np.uint8)
+
+
+def _contact_shadow(scene_rgb: np.ndarray, alpha_u8: np.ndarray, x: int, y: int, cfg: dict) -> np.ndarray:
+    ref_cfg = cfg.get("refinement", {}) or {}
+    strength = float(ref_cfg.get("shadow_strength", 0.22))
+    if strength <= 0.0:
+        return scene_rgb
+    H, W = scene_rgb.shape[:2]
+    h, w = alpha_u8.shape[:2]
+    foot = _object_foot_mask(alpha_u8)
+    if foot.max() == 0:
+        return scene_rgb
+    blur_px = max(1, int(ref_cfg.get("shadow_blur_px", 11)))
+    offset_y = int(ref_cfg.get("shadow_offset_y_px", 4))
+    shadow = np.zeros((H, W), dtype=np.uint8)
+    x1 = max(0, x); y1 = max(0, y + offset_y); x2 = min(W, x + w); y2 = min(H, y + offset_y + h)
+    ox1 = x1 - x; oy1 = y1 - (y + offset_y); ox2 = ox1 + (x2 - x1); oy2 = oy1 + (y2 - y1)
+    if x1 >= x2 or y1 >= y2:
+        return scene_rgb
+    shadow[y1:y2, x1:x2] = foot[oy1:oy2, ox1:ox2]
+    shadow = cv2.GaussianBlur(shadow, (0, 0), blur_px).astype(np.float32) / 255.0
+    shadow = shadow[..., None] * strength
+    out = scene_rgb.astype(np.float32) * (1.0 - shadow)
+    return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+
+def _boundary_weight(alpha_u8: np.ndarray, width_px: int) -> np.ndarray:
+    width_px = max(1, int(width_px))
+    mask = (alpha_u8 > 0).astype(np.uint8) * 255
+    eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * width_px + 1, 2 * width_px + 1)))
+    edge = cv2.subtract(mask, eroded)
+    weight = cv2.GaussianBlur(edge.astype(np.float32) / 255.0, (0, 0), max(1, width_px / 2.0))
+    return np.clip(weight, 0.0, 1.0)
+
+
+def _preserve_object_details(base_patch: np.ndarray, refined_patch: np.ndarray, obj_rgba: np.ndarray, cfg: dict) -> np.ndarray:
+    ref_cfg = cfg.get("refinement", {}) or {}
+    strength = float(ref_cfg.get("detail_preserve_strength", 0.82))
+    alpha = obj_rgba[:, :, 3].astype(np.float32) / 255.0
+    if alpha.max() <= 0:
+        return refined_patch
+    interior = cv2.erode((alpha > 0.1).astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    interior_f = (interior.astype(np.float32) / 255.0)[..., None] * strength
+    out = refined_patch.astype(np.float32) * (1.0 - interior_f) + base_patch.astype(np.float32) * interior_f
+    return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+
+def _refine_composite(scene_rgb: np.ndarray, obj_rgba: np.ndarray, x: int, y: int, cfg: dict) -> Tuple[np.ndarray, Dict[str, Any]]:
+    ref_cfg = cfg.get("refinement", {}) or {}
+    matched = _match_object_to_local_context(obj_rgba, scene_rgb, x, y, cfg)
+    base = _place_rgba_over_rgb(scene_rgb, matched, x, y)
+    base = _contact_shadow(base, matched[:, :, 3], x, y, cfg)
+    debug = {"used_refinement": bool(ref_cfg.get("enabled", True)), "used_seamless_clone": False}
+    if not bool(ref_cfg.get("enabled", True)):
+        return base, debug
+
+    if bool(ref_cfg.get("use_seamless_clone", True)):
+        box = _placed_object_box(x, y, matched.shape[1], matched.shape[0], scene_rgb.shape)
+        if (box[2] - box[0]) > 4 and (box[3] - box[1]) > 4:
+            try:
+                mask = (matched[:, :, 3] > 8).astype(np.uint8) * 255
+                center = (int(round((box[0] + box[2]) / 2.0)), int(round((box[1] + box[3]) / 2.0)))
+                clone = cv2.seamlessClone(matched[:, :, :3].astype(np.uint8), scene_rgb.astype(np.uint8), mask, center, cv2.NORMAL_CLONE)
+                clone = _contact_shadow(clone, matched[:, :, 3], x, y, cfg)
+                boundary = _boundary_weight(matched[:, :, 3], int(ref_cfg.get("boundary_blend_width_px", 9)))[..., None]
+                refined = base.astype(np.float32) * (1.0 - boundary) + clone.astype(np.float32) * boundary
+                refined = np.clip(refined, 0.0, 255.0).astype(np.uint8)
+                box_patch = _placed_object_box(x, y, matched.shape[1], matched.shape[0], refined.shape)
+                if box_patch[2] > box_patch[0] and box_patch[3] > box_patch[1]:
+                    ox1 = box_patch[0] - x; oy1 = box_patch[1] - y; ox2 = ox1 + (box_patch[2] - box_patch[0]); oy2 = oy1 + (box_patch[3] - box_patch[1])
+                    base_patch = base[box_patch[1]:box_patch[3], box_patch[0]:box_patch[2]]
+                    refined_patch = refined[box_patch[1]:box_patch[3], box_patch[0]:box_patch[2]]
+                    obj_patch = matched[oy1:oy2, ox1:ox2]
+                    refined[box_patch[1]:box_patch[3], box_patch[0]:box_patch[2]] = _preserve_object_details(base_patch, refined_patch, obj_patch, cfg)
+                debug["used_seamless_clone"] = True
+                return refined, debug
+            except Exception as e:
+                debug["seamless_clone_error"] = str(e)
+    return base, debug
 
 
 def _normalize_map(arr: np.ndarray, hi_pct: float = 98.0) -> np.ndarray:
@@ -1794,11 +1937,12 @@ class PlacementReasoner:
         selected = ranked_candidates[idx]
 
         obj_scaled = _resize_rgba(obj_rgba_np, selected.width, selected.height)
-        composite_np = _place_rgba_over_rgb(scene_np, obj_scaled, selected.x, selected.y)
+        composite_np, refine_debug = _refine_composite(scene_np, obj_scaled, selected.x, selected.y, self.cfg)
         composite = _np_to_pil_rgb(composite_np)
 
         composite_path = output_dir / "composite_raw.png"
         composite.save(composite_path)
+        selected.debug["refinement"] = refine_debug
 
         placement_json_path = None
         if bool(self.cfg["output"].get("save_json", True)):
@@ -1824,6 +1968,8 @@ class PlacementReasoner:
             )
             obj_preview = _np_to_pil_rgb(composite_np)
             obj_preview.save(debug_dir / "02_selected_composite_preview.png")
+            coarse_preview = _np_to_pil_rgb(_place_rgba_over_rgb(scene_np, obj_scaled, selected.x, selected.y))
+            coarse_preview.save(debug_dir / "02b_selected_composite_coarse.png")
             with (debug_dir / "03_candidates.txt").open("w", encoding="utf-8") as f:
                 for i, cand in enumerate(ranked_candidates):
                     f.write(

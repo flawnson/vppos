@@ -200,6 +200,12 @@ DEFAULT_SCENE_UNDERSTANDING_CFG: Dict[str, Any] = {
         "camera_height_m": 1.5,
         "scene_type_hint": "",
     },
+    "placement_context": {
+        "enabled": True,
+        "mask_dilate_px": 16,
+        "crop_expand_ratio": 0.18,
+        "max_crop_expand_px": 96,
+    },
     "output": {
         "save_debug": True,
         "save_json": True,
@@ -389,6 +395,38 @@ def _mask_bbox(mask_u8: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     if len(xs) == 0:
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _dilate_mask(mask_u8: np.ndarray, px: int) -> np.ndarray:
+    if px <= 0:
+        return mask_u8.copy()
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    return cv2.dilate(mask_u8, k)
+
+
+def _expand_box_xyxy(box_xyxy: Tuple[int, int, int, int], image_size: Tuple[int, int], pad_px: int) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = box_xyxy
+    w, h = image_size
+    return (
+        max(0, x0 - pad_px),
+        max(0, y0 - pad_px),
+        min(w, x1 + pad_px),
+        min(h, y1 + pad_px),
+    )
+
+
+def _build_refine_region(top_mask: np.ndarray, best_patch_mask: np.ndarray, image_size: Tuple[int, int], cfg: dict) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    ctx = cfg.get("placement_context", {}) or {}
+    base = cv2.bitwise_or(top_mask, best_patch_mask)
+    dilated = _dilate_mask(base, int(ctx.get("mask_dilate_px", 16)))
+    bbox = _mask_bbox(dilated)
+    if bbox is None:
+        bbox = _mask_bbox(best_patch_mask) or _mask_bbox(top_mask) or (0, 0, image_size[0], image_size[1])
+    bw = max(1, bbox[2] - bbox[0])
+    bh = max(1, bbox[3] - bbox[1])
+    pad = int(round(min(max(bw, bh) * float(ctx.get("crop_expand_ratio", 0.18)), float(ctx.get("max_crop_expand_px", 96)))))
+    crop = _expand_box_xyxy(bbox, image_size, pad)
+    return dilated, crop
 
 
 def _mask_to_polygon(mask_u8: np.ndarray, epsilon_ratio: float) -> List[List[int]]:
@@ -1389,6 +1427,8 @@ def _build_support_surface(
         front_edge_xy = [[float(quad[3, 0]), float(quad[3, 1])], [float(quad[2, 0]), float(quad[2, 1])]]
         back_edge_xy = [[float(quad[0, 0]), float(quad[0, 1])], [float(quad[1, 0]), float(quad[1, 1])]]
 
+    refine_region_mask, refine_crop_box = _build_refine_region(top_mask, best_patch_mask, image.size, cfg)
+
     surface = SupportSurface(
         id=f"support_{support_idx:02d}",
         label=instance.label,
@@ -1429,6 +1469,7 @@ def _build_support_surface(
             "edge_case": bool(top_info.get("edge_case", False)),
             "support_score": score,
             "top_extract_reason": top_info.get("reject_reason", "accepted"),
+            "refine_crop_xyxy": list(refine_crop_box),
         },
     )
 
@@ -1438,6 +1479,7 @@ def _build_support_surface(
         "obstacle_mask": obstacle_mask,
         "free_mask": free_mask,
         "best_patch_mask": best_patch_mask,
+        "refine_region_mask": refine_region_mask,
     }
 
 
@@ -1688,6 +1730,7 @@ class SceneUnderstandingEngine:
                 Image.fromarray(maps["obstacle_mask"], mode="L").save(debug_dir / f"{s.id}_obstacle_mask.png")
                 Image.fromarray(maps["free_mask"], mode="L").save(debug_dir / f"{s.id}_free_mask.png")
                 Image.fromarray(maps["best_patch_mask"], mode="L").save(debug_dir / f"{s.id}_best_patch_mask.png")
+                Image.fromarray(maps["refine_region_mask"], mode="L").save(debug_dir / f"{s.id}_refine_region_mask.png")
                 top_masks.append(maps["top_mask"])
                 free_masks.append(maps["best_patch_mask"])
                 obstacle_masks.append(maps["obstacle_mask"])
