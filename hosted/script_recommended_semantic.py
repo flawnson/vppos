@@ -1,28 +1,38 @@
 import argparse
+import base64
 import io
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
+
+import numpy as np
 
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFilter
 from huggingface_hub import InferenceClient
+
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 DEFAULT_EDIT_MODEL = "Qwen/Qwen-Image-Edit"
 DEFAULT_OBJECT_SEG_MODEL = "briaai/RMBG-2.0"
 DEFAULT_SCENE_SEG_MODEL = "facebook/mask2former-swin-large-coco-panoptic"
 DEFAULT_PROVIDER = "auto"
+DEFAULT_DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
 
 # Internal policy knobs.
 INTERNAL_SEG_MAX_SCENE_SIDE = 1536
-INTERNAL_EDIT_MAX_SIDE = 1408
+INTERNAL_EDIT_MAX_SIDE = 1024
 MIN_LOCAL_PADDING_PX = 80
-MAX_LOCAL_PADDING_FRACTION = 0.35
+MAX_LOCAL_PADDING_FRACTION = 0.25
 LOCAL_MASK_BLUR_RADIUS = 12
 
 # Conservative sizing policy. These are intentionally a bit smaller than before.
@@ -31,17 +41,6 @@ DEFAULT_OBJECT_WIDTH_FRAC = 0.085
 MAX_OBJECT_WIDTH_FRAC = 0.135
 ANCHOR_SEARCH_SIDE_FRAC = 0.22
 MIN_SUPPORT_SPAN_FRAC = 0.10
-
-SUPPORT_LABEL_PRIORITY = {
-    "countertop": 0,
-    "counter": 1,
-    "table": 2,
-    "dining table": 3,
-    "desk": 4,
-    "bench": 5,
-    "shelf": 6,
-    "coffee table": 7,
-}
 
 
 @dataclass
@@ -63,6 +62,181 @@ class SupportCandidate:
     local_span_width: int
     flatness: float
     score: float
+    surface_type: str = "support"
+    top_visibility: float = 0.0
+    depth_value: float = 0.5
+    occlusion_penalty: float = 0.0
+
+
+_DEPTH_PIPELINE = None
+
+
+def _build_depth_pipeline():
+    global _DEPTH_PIPELINE
+    if _DEPTH_PIPELINE is not None:
+        return _DEPTH_PIPELINE
+    try:
+        from transformers import pipeline
+    except Exception as exc:
+        raise RuntimeError(
+            "Monocular depth support detection requires transformers. Install it with: pip install transformers"
+        ) from exc
+
+    device = 0 if (torch is not None and torch.cuda.is_available()) else -1
+    _DEPTH_PIPELINE = pipeline("depth-estimation", model=DEFAULT_DEPTH_MODEL, device=device)
+    return _DEPTH_PIPELINE
+
+
+def estimate_monocular_depth(scene_rgb: Image.Image) -> np.ndarray:
+    pipe = _build_depth_pipeline()
+    result = pipe(scene_rgb.convert("RGB"))
+
+    depth_arr = None
+    depth_img = result.get("depth") if isinstance(result, dict) else None
+    if isinstance(depth_img, Image.Image):
+        depth_arr = np.asarray(depth_img.resize(scene_rgb.size, Image.LANCZOS), dtype=np.float32)
+
+    if depth_arr is None:
+        pred = result.get("predicted_depth") if isinstance(result, dict) else None
+        if pred is None:
+            raise RuntimeError("Depth pipeline did not return a usable depth map.")
+        if hasattr(pred, "detach"):
+            pred = pred.detach().cpu().numpy()
+        pred = np.asarray(pred, dtype=np.float32)
+        if pred.ndim == 4:
+            pred = pred[0, 0]
+        elif pred.ndim == 3:
+            pred = pred[0]
+        depth_arr = pred
+        if depth_arr.shape[::-1] != scene_rgb.size:
+            depth_img = Image.fromarray(depth_arr)
+            depth_arr = np.asarray(depth_img.resize(scene_rgb.size, Image.LANCZOS), dtype=np.float32)
+
+    depth_arr = np.asarray(depth_arr, dtype=np.float32)
+    depth_arr -= float(depth_arr.min())
+    denom = float(depth_arr.max())
+    if denom > 1e-6:
+        depth_arr /= denom
+
+    row_profile = depth_arr.mean(axis=1)
+    row_idx = np.linspace(0.0, 1.0, len(row_profile), dtype=np.float32)
+    corr = float(np.corrcoef(row_profile, row_idx)[0, 1]) if len(row_profile) > 4 else 0.0
+    if np.isfinite(corr) and corr < 0:
+        depth_arr = 1.0 - depth_arr
+    return depth_arr
+
+
+def depth_to_preview(depth: np.ndarray, size: tuple[int, int]) -> Image.Image:
+    arr = np.clip(depth * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, mode="L").resize(size, Image.LANCZOS)
+
+
+def _box_blur(arr: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return arr.astype(np.float32, copy=False)
+    out = arr.astype(np.float32, copy=False)
+    k = 2 * radius + 1
+    for axis in (0, 1):
+        pad = [(0, 0)] * out.ndim
+        pad[axis] = (radius, radius)
+        padded = np.pad(out, pad, mode="edge")
+        zeros_shape = list(padded.shape)
+        zeros_shape[axis] = 1
+        padded = np.concatenate([np.zeros(zeros_shape, dtype=np.float32), padded], axis=axis)
+        csum = np.cumsum(padded, axis=axis, dtype=np.float32)
+        slicer_hi = [slice(None)] * out.ndim
+        slicer_lo = [slice(None)] * out.ndim
+        slicer_hi[axis] = slice(k, k + out.shape[axis])
+        slicer_lo[axis] = slice(0, out.shape[axis])
+        out = (csum[tuple(slicer_hi)] - csum[tuple(slicer_lo)]) / float(k)
+    return out
+
+
+def _make_rect_mask(size: tuple[int, int], bbox: tuple[int, int, int, int]) -> Image.Image:
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle(bbox, fill=255)
+    return mask
+
+
+def _mask_bbox(mask: Image.Image) -> Optional[tuple[int, int, int, int]]:
+    bbox = mask.getbbox()
+    if bbox is None:
+        return None
+    return tuple(int(v) for v in bbox)
+
+
+def _iter_spans(active: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start = None
+    for i, v in enumerate(active.tolist() + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= min_len:
+                spans.append((start, i - 1))
+            start = None
+    return spans
+
+
+def _depth_preference_to_target(depth_pref: int) -> float:
+    depth_pref = max(1, min(10, int(depth_pref)))
+    return (depth_pref - 1) / 9.0
+
+
+def _depth_match_score(candidate_depth: float, depth_pref: int) -> float:
+    target = _depth_preference_to_target(depth_pref)
+    return max(0.0, 1.0 - abs(float(candidate_depth) - target) * 1.35)
+
+
+def _compute_rgb_occlusion_penalty(scene_rgb: Image.Image, x0: int, x1: int, y: int, probe_h: int) -> float:
+    scene_w, scene_h = scene_rgb.size
+    rx0 = max(0, min(scene_w, int(x0)))
+    rx1 = max(rx0 + 1, min(scene_w, int(x1)))
+    ry0 = max(0, min(scene_h, int(y - probe_h * 0.35)))
+    ry1 = max(ry0 + 1, min(scene_h, int(y + probe_h * 0.95)))
+    crop = scene_rgb.crop((rx0, ry0, rx1, ry1)).convert("L")
+    arr = np.asarray(crop, dtype=np.float32) / 255.0
+    if arr.size == 0:
+        return 0.0
+    gy, gx = np.gradient(arr)
+    energy = np.sqrt(gx * gx + gy * gy)
+    dense_edges = float(np.mean(energy > max(0.10, float(np.quantile(energy, 0.72)))))
+    texture = float(np.mean(energy))
+    return min(1.0, dense_edges * 0.7 + texture * 1.8)
+
+
+def infer_object_dimensions(object_label: str, obj_rgba: Image.Image) -> tuple[float, float]:
+    label = object_label.lower()
+    priors = [
+        (["can", "soda", "ginger ale", "coke", "pepsi", "beer can"], (0.066, 0.122)),
+        (["bottle", "wine", "water bottle"], (0.073, 0.285)),
+        (["mug", "cup"], (0.085, 0.095)),
+        (["laptop"], (0.320, 0.220)),
+        (["phone", "iphone", "smartphone"], (0.072, 0.148)),
+        (["book"], (0.155, 0.235)),
+        (["plate"], (0.260, 0.030)),
+        (["bowl"], (0.160, 0.075)),
+    ]
+    for keys, dims in priors:
+        if any(k in label for k in keys):
+            return dims
+    w, h = obj_rgba.size
+    aspect = w / float(max(1, h))
+    default_height = 0.14
+    default_width = max(0.05, min(0.22, default_height * aspect))
+    return default_width, default_height
+
+
+def estimate_target_height(scene: Image.Image, candidate: Optional[SupportCandidate], object_label: str, obj_rgba: Image.Image) -> int:
+    _, scene_h = scene.size
+    _, real_h = infer_object_dimensions(object_label, obj_rgba)
+    baseline_height = scene_h * min(0.22, max(0.06, real_h * 1.35))
+    if candidate is None:
+        return int(baseline_height)
+    bottomness = min(1.0, max(0.0, candidate.support_y / float(max(1, scene_h))))
+    perspective_factor = 0.52 + 0.72 * (bottomness ** 1.45)
+    return max(16, int(baseline_height * perspective_factor))
 
 
 class ImageStatProxy:
@@ -117,6 +291,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x", type=float, default=None, help="Optional manual x center as fraction of scene width, e.g. 0.5")
     parser.add_argument("--y", type=float, default=None, help="Optional manual y bottom as fraction of scene height, e.g. 0.78")
     parser.add_argument("--skip-refine", action="store_true", help="Save only the local precomposition without calling the image edit API")
+    parser.add_argument(
+        "--object-scene-depth",
+        type=int,
+        default=6,
+        help="Desired scene depth from 1-10, where 1 pushes placement toward deeper/background supports and 10 prefers foreground supports.",
+    )
     return parser.parse_args()
 
 
@@ -151,7 +331,7 @@ def alpha_bbox(alpha: Image.Image) -> Optional[tuple[int, int, int, int]]:
     return alpha.getbbox()
 
 
-def choose_best_mask(seg_outputs: Iterable) -> Optional[Image.Image]:
+def choose_best_mask(seg_outputs):
     best = None
     best_score = -1.0
     for output in seg_outputs:
@@ -192,188 +372,183 @@ def extract_object_rgba(obj_image: Image.Image, client: InferenceClient, seg_mod
     return out.crop(bbox)
 
 
-def _mask_bbox(mask: Image.Image) -> Optional[tuple[int, int, int, int]]:
-    bbox = mask.getbbox()
+def _semantic_support_allowed(label: str) -> bool:
+    norm = label.lower().replace("-", " ").replace("_", " ")
+    allow = [
+        "table", "desk", "counter", "countertop", "shelf", "cabinet", "nightstand",
+        "coffee table", "dining table", "end table", "worktop", "kitchen island", "dresser",
+    ]
+    deny = [
+        "wall", "floor", "ceiling", "window", "door", "picture", "monitor", "screen", "book",
+        "sink", "sofa", "chair", "plant", "lamp", "stove", "oven", "refrigerator", "person",
+    ]
+    if any(d in norm for d in deny):
+        return False
+    return any(a in norm for a in allow)
+
+
+def _segment_scene_supports(scene_rgb: Image.Image, client: InferenceClient, scene_seg_model: str):
+    outputs = client.image_segmentation(pil_to_png_bytes(scene_rgb.convert("RGB")), model=scene_seg_model)
+    return list(outputs)
+
+
+def _local_free_space_score(scene_rgb: Image.Image, bbox: tuple[int, int, int, int], support_y: int, target_h: int) -> float:
+    x0, _, x1, _ = bbox
+    scene_w, scene_h = scene_rgb.size
+    rx0 = max(0, min(scene_w, x0))
+    rx1 = max(rx0 + 1, min(scene_w, x1))
+    ry0 = max(0, support_y - max(12, int(target_h * 1.05)))
+    ry1 = max(ry0 + 1, min(scene_h, support_y - 2))
+    crop = scene_rgb.crop((rx0, ry0, rx1, ry1)).convert("L")
+    arr = np.asarray(crop, dtype=np.float32) / 255.0
+    if arr.size == 0:
+        return 0.0
+    gy, gx = np.gradient(arr)
+    energy = np.sqrt(gx * gx + gy * gy)
+    clutter = float(np.mean(energy > max(0.12, float(np.quantile(energy, 0.76)))))
+    return max(0.0, 1.0 - clutter * 1.2)
+
+
+def _candidate_from_semantic_mask(scene_rgb: Image.Image, depth: np.ndarray, mask: Image.Image, label: str, object_label: str, obj_rgba: Image.Image, depth_pref: int) -> Optional[SupportCandidate]:
+    bbox = _mask_bbox(mask)
     if bbox is None:
         return None
-    return tuple(int(v) for v in bbox)
-
-
-def _top_profile(mask: Image.Image, bbox: tuple[int, int, int, int]) -> list[Optional[int]]:
     x0, y0, x1, y1 = bbox
-    profile: list[Optional[int]] = []
-    for x in range(x0, x1):
-        hit_y = None
-        for y in range(y0, y1):
-            if mask.getpixel((x, y)) > 30:
-                hit_y = y
-                break
-        profile.append(hit_y)
-    return profile
-
-
-def _find_best_flat_span(profile: list[Optional[int]], x0: int, scene_h: int) -> Optional[tuple[int, int, int, float]]:
-    min_span = max(18, int(len(profile) * MIN_SUPPORT_SPAN_FRAC))
-    best = None
-    best_score = -1e9
-    start = 0
-    while start < len(profile):
-        while start < len(profile) and profile[start] is None:
-            start += 1
-        if start >= len(profile):
-            break
-        end = start
-        ys = []
-        while end < len(profile) and profile[end] is not None:
-            ys.append(profile[end])
-            end += 1
-        if len(ys) >= min_span:
-            local_min = min(ys)
-            local_max = max(ys)
-            y_variation = local_max - local_min
-            span_width = end - start
-            median_y = sorted(ys)[len(ys) // 2]
-            flatness = 1.0 / (1.0 + y_variation)
-            lower_bonus = max(0.0, (median_y / float(scene_h)) - 0.28)
-            score = span_width * 2.2 + lower_bonus * 120.0 - y_variation * 7.0
-            if score > best_score:
-                best_score = score
-                anchor_x = x0 + (start + end) // 2
-                best = (anchor_x, median_y, span_width, flatness)
-        start = end + 1
-    return best
-
-
-def _local_span_around_anchor(profile: list[Optional[int]], x0: int, anchor_x: int, support_y: int) -> tuple[int, int, int, float]:
-    idx = max(0, min(len(profile) - 1, anchor_x - x0))
-    tolerance = max(3, int(0.008 * max(1, len(profile))))
-    left = idx
-    while left - 1 >= 0 and profile[left - 1] is not None and abs(profile[left - 1] - support_y) <= tolerance:
-        left -= 1
-    right = idx
-    while right + 1 < len(profile) and profile[right + 1] is not None and abs(profile[right + 1] - support_y) <= tolerance:
-        right += 1
-    span_width = right - left + 1
-    flat_band = [p for p in profile[left:right + 1] if p is not None]
-    y_variation = (max(flat_band) - min(flat_band)) if flat_band else 999
-    flatness = 1.0 / (1.0 + y_variation)
-    return x0 + left, x0 + right, span_width, flatness
-
-
-def find_support_candidates(scene_rgb: Image.Image, client: InferenceClient, seg_model: str) -> list[SupportCandidate]:
-    try:
-        seg = client.image_segmentation(pil_to_png_bytes(scene_rgb), model=seg_model)
-    except Exception:
-        return []
-
     scene_w, scene_h = scene_rgb.size
-    candidates: list[SupportCandidate] = []
+    if x1 - x0 < max(20, int(scene_w * MIN_SUPPORT_SPAN_FRAC)):
+        return None
+    mask_arr = np.asarray(mask.resize(scene_rgb.size, Image.LANCZOS), dtype=np.float32) / 255.0
+    ys, xs = np.where(mask_arr > 0.35)
+    if len(xs) == 0:
+        return None
+    support_y = int(np.quantile(ys, 0.12))
+    band_y0 = max(0, support_y - max(3, int(scene_h * 0.008)))
+    band_y1 = min(scene_h, support_y + max(4, int(scene_h * 0.012)))
+    band = mask_arr[band_y0:band_y1]
+    col_mass = band.mean(axis=0)
+    spans = _iter_spans(col_mass > max(0.20, float(np.mean(col_mass) * 0.80)), max(16, int(scene_w * MIN_SUPPORT_SPAN_FRAC * 0.65)))
+    if spans:
+        sx0, sx1 = max(spans, key=lambda s: s[1] - s[0])
+        x0 = sx0
+        x1 = sx1 + 1
+    center_x = int(round((x0 + x1) / 2.0))
+    target_h = estimate_target_height(scene_rgb, None, object_label, obj_rgba)
+    depth_value = float(depth[min(depth.shape[0]-1, support_y), min(depth.shape[1]-1, center_x)])
+    occlusion_penalty = _compute_rgb_occlusion_penalty(scene_rgb, x0, x1, support_y, max(18, target_h))
+    free_space = _local_free_space_score(scene_rgb, (x0, y0, x1, y1), support_y, target_h)
+    top_visibility = min(1.0, max(0.0, (y1 - support_y) / float(max(1, y1 - y0))))
+    score = (
+        (x1 - x0) * 1.0
+        + free_space * 95.0
+        + _depth_match_score(depth_value, depth_pref) * 70.0
+        + top_visibility * 60.0
+        - occlusion_penalty * 85.0
+    )
+    return SupportCandidate(
+        label=label,
+        mask=mask.resize(scene_rgb.size, Image.LANCZOS).convert("L"),
+        bbox=(x0, y0, x1, y1),
+        support_y=support_y,
+        anchor_x=center_x,
+        local_span_width=max(1, x1 - x0),
+        flatness=0.88,
+        score=float(score),
+        surface_type="semantic_support",
+        top_visibility=top_visibility,
+        depth_value=depth_value,
+        occlusion_penalty=occlusion_penalty,
+    )
 
-    for output in seg:
-        label = str(getattr(output, "label", "")).lower().strip()
-        if label not in SUPPORT_LABEL_PRIORITY:
-            continue
 
-        mask = output.mask.convert("L")
-        if mask.size != scene_rgb.size:
-            mask = mask.resize(scene_rgb.size, Image.LANCZOS)
-        bbox = _mask_bbox(mask)
-        if bbox is None:
-            continue
-        x0, y0, x1, y1 = bbox
-        width = x1 - x0
-        height = y1 - y0
-        area = width * height
-        if area <= 0:
-            continue
-        if y1 < int(scene_h * 0.35):
-            continue
-        if width < int(scene_w * 0.12):
-            continue
+def _fallback_semantic_candidate(scene_rgb: Image.Image, depth: np.ndarray, depth_pref: int) -> SupportCandidate:
+    scene_w, scene_h = scene_rgb.size
+    support_y = int(scene_h * (0.58 + 0.20 * _depth_preference_to_target(depth_pref)))
+    x0 = int(scene_w * 0.20)
+    x1 = int(scene_w * 0.80)
+    y0 = max(0, support_y - int(scene_h * 0.10))
+    y1 = min(scene_h, support_y + int(scene_h * 0.08))
+    mask = _make_rect_mask((scene_w, scene_h), (x0, y0, x1, y1))
+    depth_value = float(depth[min(depth.shape[0]-1, support_y), min(depth.shape[1]-1, (x0+x1)//2)])
+    return SupportCandidate(
+        label="support",
+        mask=mask,
+        bbox=(x0, y0, x1, y1),
+        support_y=support_y,
+        anchor_x=(x0 + x1)//2,
+        local_span_width=x1 - x0,
+        flatness=0.7,
+        score=100.0,
+        surface_type="semantic_support",
+        top_visibility=0.75,
+        depth_value=depth_value,
+        occlusion_penalty=0.2,
+    )
 
-        profile = _top_profile(mask, bbox)
-        flat = _find_best_flat_span(profile, x0, scene_h)
-        if flat is None:
-            continue
-        anchor_x, support_y, _, _ = flat
-        span_left, span_right, local_span_width, flatness = _local_span_around_anchor(profile, x0, anchor_x, support_y)
-        if local_span_width < int(scene_w * MIN_SUPPORT_SPAN_FRAC):
-            continue
 
-        center_x = (x0 + x1) / 2.0
-        center_bias = 1.0 - min(1.0, abs(center_x - scene_w / 2.0) / (scene_w / 2.0))
-        lower_bias = min(1.0, support_y / float(scene_h))
-        width_frac = width / float(scene_w)
-        priority_bonus = max(0, 10 - SUPPORT_LABEL_PRIORITY[label]) * 16.0
-        score = (
-            priority_bonus
-            + local_span_width * 1.8
-            + width_frac * 120.0
-            + flatness * 180.0
-            + center_bias * 35.0
-            + lower_bias * 40.0
-        )
-
-        candidates.append(
-            SupportCandidate(
-                label=label,
-                mask=mask,
-                bbox=bbox,
-                support_y=int(support_y),
-                anchor_x=int(anchor_x),
-                local_span_width=int(local_span_width),
-                flatness=float(flatness),
-                score=float(score),
-            )
-        )
-
+def find_support_candidates(scene_rgb: Image.Image, depth: np.ndarray, depth_pref: int = 6, client: Optional[InferenceClient] = None, object_rgb: Optional[Image.Image] = None, object_label: str = "object", scene_seg_model: str = DEFAULT_SCENE_SEG_MODEL, obj_rgba: Optional[Image.Image] = None) -> list[SupportCandidate]:
+    del object_rgb
+    if client is None or obj_rgba is None:
+        return [_fallback_semantic_candidate(scene_rgb, depth, depth_pref)]
+    candidates = []
+    try:
+        for output in _segment_scene_supports(scene_rgb, client, scene_seg_model):
+            label = str(getattr(output, "label", "support"))
+            if not _semantic_support_allowed(label):
+                continue
+            mask = output.mask.convert("L")
+            candidate = _candidate_from_semantic_mask(scene_rgb, depth, mask, label, object_label, obj_rgba, depth_pref)
+            if candidate is not None:
+                score = float(getattr(output, "score", 0.5))
+                candidate.score += score * 30.0
+                candidates.append(candidate)
+    except Exception:
+        pass
+    if not candidates:
+        return [_fallback_semantic_candidate(scene_rgb, depth, depth_pref)]
     candidates.sort(key=lambda c: c.score, reverse=True)
-    return candidates
+    return candidates[:12]
 
 
-def choose_support_candidate(candidates: list[SupportCandidate], scene_size: tuple[int, int]) -> Optional[SupportCandidate]:
+def choose_support_candidate(candidates: list[SupportCandidate], scene_size: tuple[int, int], depth_pref: int = 6) -> Optional[SupportCandidate]:
     if not candidates:
         return None
     scene_w, _ = scene_size
     best = None
     best_score = -1e18
     for c in candidates:
-        x0, _, x1, _ = c.bbox
-        width_frac = (x1 - x0) / float(scene_w)
-        conservative_surface_bonus = min(1.0, c.local_span_width / max(1.0, scene_w * 0.24)) * 40.0
-        score = c.score + conservative_surface_bonus + width_frac * 30.0
+        width_frac = c.local_span_width / float(max(1, scene_w))
+        score = c.score + c.flatness * 50.0 + c.top_visibility * 55.0 + width_frac * 40.0 - c.occlusion_penalty * 85.0
         if score > best_score:
             best_score = score
             best = c
     return best
 
-
 def compute_target_width(scene: Image.Image, obj_rgba: Image.Image, candidate: Optional[SupportCandidate], args: argparse.Namespace) -> int:
     scene_w, scene_h = scene.size
     obj_w, obj_h = obj_rgba.size
-    _ = obj_w, obj_h
+    obj_aspect = obj_w / float(max(1, obj_h))
 
-    width_from_scene = int(scene_w * DEFAULT_OBJECT_WIDTH_FRAC)
-    width_from_height = int(scene_h * 0.16)
-    target = min(width_from_scene, width_from_height)
+    target_height = estimate_target_height(scene, candidate, args.object_label, obj_rgba)
+    target = int(target_height * obj_aspect)
 
     if candidate is not None:
-        x0, _, x1, _ = candidate.bbox
-        support_width = x1 - x0
-        local_span = candidate.local_span_width
-        # Conservative: fit to a modest fraction of the locally flat surface, not the full support bbox.
-        width_from_local_span = int(local_span * 0.22)
-        width_from_support = int(support_width * 0.12)
-        width_from_scene = int(scene_w * DEFAULT_OBJECT_WIDTH_FRAC)
-        target = min(max(width_from_local_span, int(scene_w * MIN_OBJECT_WIDTH_FRAC)), width_from_support, width_from_scene)
-        # If the support is especially narrow or not that flat, shrink further.
+        span_cap_ratio = 0.46 if candidate.surface_type == "top_surface" else 0.34
+        support_cap_ratio = 0.28 if candidate.surface_type == "top_surface" else 0.22
+        span_cap = int(candidate.local_span_width * span_cap_ratio)
+        support_cap = int((candidate.bbox[2] - candidate.bbox[0]) * support_cap_ratio)
+        target = min(target, span_cap, support_cap)
         if candidate.flatness < 0.35:
-            target = int(target * 0.88)
-        if local_span < int(scene_w * 0.18):
-            target = int(target * 0.88)
+            target = int(target * 0.9)
+        if candidate.local_span_width < int(scene_w * 0.18):
+            target = int(target * 0.9)
+        target *= 0.94 + 0.18 * _depth_match_score(candidate.depth_value, args.object_scene_depth)
+        if candidate.occlusion_penalty > 0.44:
+            target *= 0.9
 
     target = max(int(scene_w * MIN_OBJECT_WIDTH_FRAC), target)
     target = min(int(scene_w * MAX_OBJECT_WIDTH_FRAC), target)
+
+    target = int(target * (0.90 + 0.22 * _depth_preference_to_target(args.object_scene_depth)))
 
     if args.scale is not None:
         target = max(16, int(target * args.scale))
@@ -392,14 +567,23 @@ def compute_auto_placement(scene: Image.Image, obj_rgba: Image.Image, chosen_can
     if args.x is not None:
         center_x = int(scene_w * args.x)
     elif chosen_candidate is not None:
-        center_x = chosen_candidate.anchor_x
+        span_margin = max(4, int(target_width * 0.08))
+        min_center = chosen_candidate.bbox[0] + span_margin + target_width // 2
+        max_center = chosen_candidate.bbox[2] - span_margin - target_width // 2
+        if min_center <= max_center:
+            center_x = max(min_center, min(max_center, chosen_candidate.anchor_x))
+        else:
+            center_x = chosen_candidate.anchor_x
     else:
         center_x = scene_w // 2
 
     if args.y is not None:
         target_bottom = int(scene_h * args.y)
     elif chosen_candidate is not None:
-        target_bottom = chosen_candidate.support_y + max(2, int(scene_h * 0.004))
+        lift = max(2, int(scene_h * 0.004))
+        if chosen_candidate.surface_type == "ledge_surface":
+            lift = max(1, int(scene_h * 0.0025))
+        target_bottom = chosen_candidate.support_y + lift
     else:
         target_bottom = int(scene_h * 0.80)
 
@@ -473,7 +657,7 @@ def draw_support_candidates_preview(scene: Image.Image, candidates: list[Support
         draw.rectangle([x0, y0, x1, y1], outline=color, width=3 if is_chosen else 2)
         draw.line((x0, c.support_y, x1, c.support_y), fill=(255, 220, 0, 255) if is_chosen else (210, 180, 255, 200), width=3)
         draw.ellipse((c.anchor_x - 6, c.support_y - 6, c.anchor_x + 6, c.support_y + 6), fill=color)
-        label = f"{idx+1}:{c.label} s={int(c.score)}"
+        label = f"{idx+1}:{c.surface_type} s={int(c.score)} tv={c.top_visibility:.2f}"
         tx = max(0, min(preview.size[0] - 180, x0))
         ty = max(0, y0 - 18)
         draw.text((tx, ty), label, fill=color)
@@ -512,16 +696,16 @@ def draw_placement_preview(scene: Image.Image, placement: Placement, chosen_cand
 
 def compute_local_crop_box(placement: Placement, scene_size: tuple[int, int]) -> tuple[int, int, int, int]:
     scene_w, scene_h = scene_size
-    pad_x = max(MIN_LOCAL_PADDING_PX, int(placement.width * 0.9))
-    pad_y = max(MIN_LOCAL_PADDING_PX, int(placement.height * 0.9))
+    pad_x = max(MIN_LOCAL_PADDING_PX, int(placement.width * 0.55))
+    pad_y = max(MIN_LOCAL_PADDING_PX, int(placement.height * 0.55))
 
     pad_x = min(pad_x, int(scene_w * MAX_LOCAL_PADDING_FRACTION))
     pad_y = min(pad_y, int(scene_h * MAX_LOCAL_PADDING_FRACTION))
 
     x0 = max(0, placement.left - pad_x)
-    y0 = max(0, placement.top - int(pad_y * 0.8))
+    y0 = max(0, placement.top - int(pad_y * 0.55))
     x1 = min(scene_w, placement.left + placement.width + pad_x)
-    y1 = min(scene_h, placement.top + placement.height + int(pad_y * 1.35))
+    y1 = min(scene_h, placement.top + placement.height + int(pad_y * 0.95))
     return x0, y0, x1, y1
 
 
@@ -575,6 +759,7 @@ def save_final_image(image: Image.Image, path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
+    args.object_scene_depth = max(1, min(10, int(args.object_scene_depth)))
     debug_run = DebugRun(args.output)
     client = build_client(args.provider)
 
@@ -592,8 +777,12 @@ def main() -> int:
     debug_run.save_image(object_mask, "04_object_mask.png")
     debug_run.save_image(obj_rgba, "05_object_cutout.png")
 
-    print("[2/6] Finding and ranking support surfaces...")
-    candidates_small = find_support_candidates(scene_for_seg.convert("RGB"), client, args.scene_seg_model)
+    print("[2/6] Estimating monocular depth and finding support surfaces...")
+    depth_small = estimate_monocular_depth(scene_for_seg.convert("RGB"))
+    depth_preview_small = depth_to_preview(depth_small, scene_for_seg.size)
+    debug_run.save_image(depth_preview_small, "06_depth_preview_scene_for_support.png")
+
+    candidates_small = find_support_candidates(scene_for_seg.convert("RGB"), depth_small, depth_pref=args.object_scene_depth, client=client, object_rgb=obj_rgba.convert("RGB"), object_label=args.object_label, scene_seg_model=args.scene_seg_model, obj_rgba=obj_rgba)
     candidates_full: list[SupportCandidate] = []
     scale_x = scene_full.width / float(scene_for_seg.width)
     scale_y = scene_full.height / float(scene_for_seg.height)
@@ -612,9 +801,13 @@ def main() -> int:
                 local_span_width=int(round(c.local_span_width * scale_x)),
                 flatness=c.flatness,
                 score=c.score,
+                surface_type=c.surface_type,
+                top_visibility=c.top_visibility,
+                depth_value=c.depth_value,
+                occlusion_penalty=c.occlusion_penalty,
             )
         )
-    chosen_candidate = choose_support_candidate(candidates_full, scene_full.size)
+    chosen_candidate = choose_support_candidate(candidates_full, scene_full.size, depth_pref=args.object_scene_depth)
     if chosen_candidate is not None:
         print(f"      Chosen support: {chosen_candidate.label} | score={chosen_candidate.score:.1f} | span={chosen_candidate.local_span_width}px")
     else:
@@ -685,6 +878,8 @@ def main() -> int:
         "edit_model": args.edit_model,
         "object_seg_model": args.object_seg_model,
         "scene_seg_model": args.scene_seg_model,
+        "depth_model": DEFAULT_DEPTH_MODEL,
+        "support_model": args.scene_seg_model,
         "placement": asdict(placement),
         "chosen_support": None if chosen_candidate is None else {
             "label": chosen_candidate.label,
@@ -694,6 +889,10 @@ def main() -> int:
             "local_span_width": chosen_candidate.local_span_width,
             "flatness": chosen_candidate.flatness,
             "score": chosen_candidate.score,
+            "surface_type": chosen_candidate.surface_type,
+            "top_visibility": chosen_candidate.top_visibility,
+            "depth_value": chosen_candidate.depth_value,
+            "occlusion_penalty": chosen_candidate.occlusion_penalty,
         },
         "support_candidates": [
             {
@@ -704,6 +903,10 @@ def main() -> int:
                 "local_span_width": c.local_span_width,
                 "flatness": c.flatness,
                 "score": c.score,
+                "surface_type": c.surface_type,
+                "top_visibility": c.top_visibility,
+                "depth_value": c.depth_value,
+                "occlusion_penalty": c.occlusion_penalty,
             }
             for c in candidates_full[:8]
         ],
@@ -714,7 +917,10 @@ def main() -> int:
         "edit_input_size": {"width": precomp_crop_for_edit.width, "height": precomp_crop_for_edit.height},
         "crop_scale_sent_to_model": crop_scale,
         "skip_refine": args.skip_refine,
+        "object_scene_depth": args.object_scene_depth,
         "internal_policy": {
+            "depth_model": DEFAULT_DEPTH_MODEL,
+            "support_model": args.scene_seg_model,
             "segmentation_max_side": INTERNAL_SEG_MAX_SCENE_SIDE,
             "edit_crop_max_side": INTERNAL_EDIT_MAX_SIDE,
             "min_local_padding_px": MIN_LOCAL_PADDING_PX,
@@ -723,7 +929,7 @@ def main() -> int:
             "default_object_width_frac": DEFAULT_OBJECT_WIDTH_FRAC,
             "max_object_width_frac": MAX_OBJECT_WIDTH_FRAC,
         },
-        "note": "Placement now ranks multiple support candidates, anchors on the flattest local span, and sizes the product conservatively from local support geometry instead of scene width.",
+        "note": "Support selection now uses semantically segmented support surfaces plus object-aware scoring for usable span, free space above, depth preference, and clutter risk. This is the recommended version.",
     }
 
     print("[6/6] Saving output...")
