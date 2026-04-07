@@ -295,12 +295,15 @@ class ImageStatProxy:
 
 
 class DebugRun:
-    def __init__(self, requested_output: str):
+    def __init__(self, requested_output: str, explicit_run_dir: Optional[str] = None):
         requested = Path(requested_output)
         base_dir = requested.parent if requested.parent != Path("") else Path.cwd()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem = requested.stem or "run"
-        self.run_dir = base_dir / f"{stem}_{timestamp}"
+        if explicit_run_dir is not None:
+            self.run_dir = Path(explicit_run_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stem = requested.stem or "run"
+            self.run_dir = base_dir / f"{stem}_{timestamp}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.final_output = self.run_dir / requested.name
 
@@ -1623,6 +1626,8 @@ def main() -> int:
     output_dir = requested_output.parent if requested_output.parent != Path("") else Path.cwd()
     output_name = requested_output.name
     base_stem = requested_output.stem or "run"
+    batch_root_dir = output_dir / base_stem
+    batch_root_dir.mkdir(parents=True, exist_ok=True)
 
     total_runs = len(scene_paths) * len(object_paths)
     run_index = 0
@@ -1634,14 +1639,15 @@ def main() -> int:
             run_args.object_image = object_path
             run_args.object_label = object_label_map[object_path]
 
+            combo_dir = None
             if multi_run:
-                combo_dir = output_dir / f"{base_stem}__{_stem_slug(scene_path)}__{_stem_slug(object_path)}"
+                combo_dir = batch_root_dir / f"{base_stem}__{_stem_slug(scene_path)}__{_stem_slug(object_path)}"
                 combo_dir.mkdir(parents=True, exist_ok=True)
                 run_args.output = str(combo_dir / output_name)
             else:
-                run_args.output = args.output
+                run_args.output = str(batch_root_dir / output_name)
 
-            debug_run = DebugRun(run_args.output)
+            debug_run = DebugRun(run_args.output, explicit_run_dir=str(combo_dir) if combo_dir is not None else None)
 
             scene_full = load_rgba(run_args.scene)
             obj = load_rgba(run_args.object_image)
