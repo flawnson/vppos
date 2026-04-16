@@ -1,0 +1,89 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# logs / temp
+*.log
+*.tmp
+*.out
+*.pid
+tmp/
+temp/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+secret/
+credentials/
+*.secret
+*.secrets
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# packaging / build
+build/
+dist/
+out/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheels/
+
+# notebooks
+.ipynb_checkpoints/
+
+# local databases / runtime state
+*.sqlite
+*.sqlite3
+*.db
+
+# test / debug artifacts
+screenshots/
+playwright-report/
+test-results/
+
+# type / lint / tooling caches
+.dmypy.json
+.pytype/
+
+# misc generated files
+*.csv
+*.tsv
+*.parquet
+*.feather
+
+# model / large binary artifacts
+models/
+checkpoints/
+artifacts/
+
+# local app config
+.local/
+.cache/
